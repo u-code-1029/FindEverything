@@ -1,0 +1,8 @@
+**/bin/
+**/obj/
+TestResults/
+.local/
+*.db
+*.db-shm
+*.db-wal
+*.writer.lock
