@@ -7,7 +7,8 @@
 ## 현재 기능
 
 - 파일·폴더 이름, 경로, 파일 크기, 생성일·수정일 수집. 파일 내용은 열지 않습니다.
-- 탐색할 루트 선택, 폴더 이름·경로·파일 패턴 제외, 링크·정션 탐색 방지.
+- 탐색할 루트 선택, 폴더 이름·이름 Regex·경로·파일 패턴 제외, JSON 설정, 링크·정션 탐색 방지.
+- 스캔별 제외 경로·사유·건수와 반복 폴더 이름·관찰 빈도 보고.
 - 전체 탐색과 지정한 하위 폴더만 갱신하는 탐색, 진행률과 취소.
 - 비용이 큰 폴더를 명시적 규칙·이전 탐색 이력·작업 예산으로 보류하고, 필요할 때 해당 범위만 탐색.
 - 호스트가 전달한 변경 폴더 목록에서 제외 범위·중복·부모에 포함되는 작업을 제거하는 갱신 계획 API.
@@ -69,7 +70,63 @@ dotnet run --project src/FindEverything.Cli -c Release --no-build -- search --da
 dotnet run --project src/FindEverything.Cli -c Release --no-build -- scan --root 'D:\Data' --scope 'D:\Data\Projects\Alpha' --database 'C:\FindEverythingIndex\data.db' --exclude-dir 'cache' --exclude-path 'D:\Data\Temp' --exclude-file '*.tmp'
 ```
 
-규칙은 CLI가 영구 저장하지 않습니다. 루트 전체에 적용하는 제외 정책을 바꿨다면 새 규칙으로 전체 루트를 갱신해야 다른 하위 폴더의 기존 색인에도 반영됩니다. 특정 폴더를 새로 제외한 경우에는 그 폴더의 부모나 전체 루트를 갱신해야 폴더 자체의 기존 검색 항목까지 정리됩니다.
+규칙은 DB에 영구 저장하지 않습니다. `--config`로 같은 JSON 설정을 재사용하거나 각 옵션을 다시 전달합니다. 루트 전체에 적용하는 제외 정책을 바꿨다면 새 규칙으로 전체 루트를 갱신해야 다른 하위 폴더의 기존 색인에도 반영됩니다. 특정 폴더를 새로 제외한 경우에는 그 폴더의 부모나 전체 루트를 갱신해야 폴더 자체의 기존 검색 항목까지 정리됩니다.
+
+### 폴더 이름 Regex와 JSON 설정
+
+Regex는 **폴더 이름 하나**에 적용합니다. 전체 경로나 파일 이름에는 적용하지 않습니다. `full`은 이름 전체가 일치해야 하고, `partial`은 이름 중 일부만 일치해도 제외합니다. 제외된 폴더 내부는 열지 않으며, `--scope`로 그 아래를 지정하거나 `--on-demand`를 사용해도 제외 규칙은 유지됩니다.
+
+```powershell
+dotnet run --project src/FindEverything.Cli -c Release --no-build -- scan --root 'D:\Data' --database 'C:\FindEverythingIndex\data.db' --exclude-dir-regex 'cache(-\d+)?' --exclude-dir-regex-partial '임시|temp'
+```
+
+두 Regex 옵션은 각각 여러 번 지정할 수 있습니다. 기본 대소문자 처리는 기존 이름 제외와 같이 Windows에서는 무시하고 다른 OS에서는 구분합니다. JSON 규칙의 `ignoreCase`로 개별 설정할 수 있습니다.
+
+다음 내용을 `scan-options.json`에 저장합니다. JSON에서는 Regex의 `\`를 `\\`로 이스케이프합니다.
+
+```json
+{
+  "excludedDirectoryNames": ["node_modules", "obj"],
+  "excludedDirectoryNameRegexes": [
+    { "pattern": "cache(-\\d+)?", "matchMode": "full", "ignoreCase": true },
+    { "pattern": "임시|temp", "matchMode": "partial" }
+  ],
+  "excludedPaths": [],
+  "excludedFilePatterns": ["*.tmp"],
+  "maxEntriesPerSecond": 1000,
+  "directoryDelay": "00:00:00.010",
+  "maxRecordedExclusions": 1000,
+  "maxTrackedDirectoryNames": 4096,
+  "deferral": { "directoryNames": ["Archive"] }
+}
+```
+
+```powershell
+dotnet run --project src/FindEverything.Cli -c Release --no-build -- scan --root 'D:\Data' --database 'C:\FindEverythingIndex\data.db' --config '.\scan-options.json' --exclude-path 'D:\Data\Private'
+dotnet run --project src/FindEverything.Cli -c Release --no-build -- scan --root 'D:\Data' --scope 'D:\Data\Archive' --database 'C:\FindEverythingIndex\data.db' --config '.\scan-options.json' --on-demand
+```
+
+JSON은 `ScanOptions`의 camelCase 필드를 사용합니다. 생략한 필드는 기존 기본값을 사용하고, `matchMode` 기본값은 `full`입니다. 시간 값은 `TimeSpan` 문자열입니다. JSON의 제외·보류 상대 경로는 **설정 파일이 있는 폴더 기준**, CLI 경로는 현재 작업 폴더 기준입니다. CLI에서 추가한 목록은 JSON 목록에 합쳐지고, 지정한 수치 옵션은 해당 JSON 값에 우선합니다. 설정은 매 스캔에만 적용되며 다음 실행에 자동 상속되지 않습니다.
+
+알 수 없는 필드, 중복 JSON 필드, 잘못된 타입·Regex·루트 밖 경로는 DB 쓰기 전에 거부합니다. Regex 매칭은 한 번당 100ms로 제한하며, 시간 초과는 탐색 실패로 처리하여 이번 임시 결과 전체를 버리고 기존 색인·보류 정보를 보존합니다.
+
+### 스캔별 진단과 통계
+
+각 `scan`의 JSON 응답에는 `scanId`와 `diagnostics`가 함께 반환됩니다. 진단 보고서는 DB 이력으로 저장하지 않으므로 필요하면 표준 출력을 파일로 저장합니다.
+
+| 필드 | 의미 |
+|---|---|
+| `excludedPaths` | 실제 제외한 경로, 종류, 사유(`path`, `directoryName`, `directoryNameRegex`, `filePattern`), 매칭 규칙 |
+| `exclusions` | 사유별 건수와 제외 폴더·파일 수. 여러 규칙과 일치해도 한 번만 집계 |
+| `omittedExcludedPaths` | 상세 경로 기록 한도를 넘어 생략된 건수. 전체 제외 통계는 계속 집계 |
+| `repeatedDirectoryNames` | 두 번 이상 관찰한 동일 폴더 이름, 관찰 횟수, 이름별 최대 3개 예시 경로 |
+| `untrackedDirectoryNameOccurrences` | 이름 종류 한도 때문에 새 이름을 추적하지 못한 관찰 건수 |
+
+사유 우선순위는 경로 → 정확한 폴더 이름 → Regex → 파일 패턴입니다. Regex 간에는 설정 순서를 사용합니다. 반복 이름은 OS의 경로 대소문자 규칙으로 묶고, 관찰한 제외·보류·링크 폴더도 포함합니다. 전체 루트 자체는 제외하고 실제 관찰한 하위 범위 폴더는 포함합니다. 제외된 상위 폴더 때문에 건너뛴 scope는 제외 건수 1로 기록하며, 열지 않은 폴더 이름을 관찰했다고 집계하지 않습니다.
+
+상세 제외 경로는 기본 1,000개, 추적하는 서로 다른 폴더 이름은 기본 4,096종으로 제한합니다. `maxRecordedExclusions`(0~10,000), `maxTrackedDirectoryNames`(0~100,000)로 조정할 수 있습니다. 이름 한도에 도달해도 이미 추적 중인 이름의 횟수는 계속 정확히 증가합니다. 결과는 횟수 내림차순·이름순이며, 한도 안에 처음 관찰한 이름을 대상으로 하므로 전체 트리의 상위 빈도 순위는 아닙니다.
+
+이 통계는 실제 읽은 범위의 관찰값입니다. 제외·보류 폴더 아래의 미탐색 항목 수나 절약한 시간을 추정하지 않습니다. 취소·부분 완료에서도 관찰한 진단은 반환되지만, 검색 색인 반영 여부는 기존 완료 상태 규칙을 따릅니다.
 
 결과는 표준 출력에 JSON으로, 진행률·오류는 표준 오류에 출력합니다. `Ctrl+C`로 취소할 수 있습니다. 종료 코드는 성공 `0`, 잘못된 입력·실패 `1`, 부분 탐색 `2`, 보류 범위가 있는 탐색 `3`, 취소 `130`입니다. SMB 요청 등 이미 진행 중인 OS 호출은 반환될 때까지 취소가 지연될 수 있습니다.
 
@@ -93,7 +150,7 @@ dotnet run --project src/FindEverything.Cli -c Release --no-build -- scan --root
 dotnet run --project src/FindEverything.Cli -c Release --no-build -- pending --database 'C:\FindEverythingIndex\data.db' --root 'D:\Data' --limit 50 --offset 0
 ```
 
-목록에서 필요한 범위를 선택해 `--scope`와 `--on-demand`로 탐색할 수 있습니다. `--on-demand`는 값 없이 지정하며 보류 규칙·작업 예산만 우회합니다. 영구 제외, 속도 제한, 링크 검사와 취소는 유지합니다. CLI는 제외 정책을 저장하지 않으므로 원래의 제외 옵션을 다시 전달해야 합니다.
+목록에서 필요한 범위를 선택해 `--scope`와 `--on-demand`로 탐색할 수 있습니다. `--on-demand`는 값 없이 지정하며 보류 규칙·작업 예산만 우회합니다. 영구 제외, 속도 제한, 링크 검사와 취소는 유지합니다. 원래의 제외 옵션 또는 같은 `--config`를 다시 전달해야 합니다.
 
 ```powershell
 dotnet run --project src/FindEverything.Cli -c Release --no-build -- scan --root 'D:\Data' --scope 'D:\Data\Archive' --database 'C:\FindEverythingIndex\data.db' --on-demand --exclude-dir 'cache'

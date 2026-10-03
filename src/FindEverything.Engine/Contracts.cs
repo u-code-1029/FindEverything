@@ -3,6 +3,30 @@ namespace FindEverything.Engine;
 public enum EntryKind { File, Directory }
 public enum ScanStatus { Completed, Partial, Cancelled, Deferred }
 public enum DeferralReason { ExplicitRule, HistoricalEntryCount, HistoricalDuration, EntryBudget, TimeBudget, PendingLimit }
+public enum RegexMatchMode { Full, Partial }
+public enum ExclusionReason { Path, DirectoryName, DirectoryNameRegex, FilePattern }
+
+public sealed record DirectoryNameRegex
+{
+    public required string Pattern { get; init; }
+    public RegexMatchMode MatchMode { get; init; } = RegexMatchMode.Full;
+    // Null follows the host's path case semantics, like exact directory names.
+    public bool? IgnoreCase { get; init; }
+}
+
+public sealed record ExcludedEntry(string Path, EntryKind Kind, ExclusionReason Reason, string Rule);
+public sealed record RepeatedDirectoryName(string Name, long Count, IReadOnlyList<string> SamplePaths);
+public sealed record ExclusionStatistics(long Paths, long DirectoryNames, long DirectoryNameRegexes,
+    long FilePatterns, long Directories, long Files);
+public sealed record ScanDiagnostics
+{
+    public IReadOnlyList<ExcludedEntry> ExcludedPaths { get; init; } = [];
+    public long OmittedExcludedPaths { get; init; }
+    public ExclusionStatistics Exclusions { get; init; } = new(0, 0, 0, 0, 0, 0);
+    public IReadOnlyList<RepeatedDirectoryName> RepeatedDirectoryNames { get; init; } = [];
+    // Once the distinct-name cap is reached, tracked names keep exact counts but new names are omitted.
+    public long UntrackedDirectoryNameOccurrences { get; init; }
+}
 
 public sealed record IndexedEntry(
     string FullPath, string Name, string ParentPath, EntryKind Kind,
@@ -62,11 +86,13 @@ public sealed record ScanReport(
     ScanProgress Progress, IReadOnlyList<ScanError> Errors)
 {
     public IReadOnlyList<PendingScope> PendingScopes { get; init; } = [];
+    public ScanDiagnostics Diagnostics { get; init; } = new();
 }
 
 public sealed record ScanOptions
 {
     public IReadOnlyList<string> ExcludedDirectoryNames { get; init; } = [];
+    public IReadOnlyList<DirectoryNameRegex> ExcludedDirectoryNameRegexes { get; init; } = [];
     public IReadOnlyList<string> ExcludedPaths { get; init; } = [];
     public IReadOnlyList<string> ExcludedFilePatterns { get; init; } = [];
     public int BatchSize { get; init; } = 256;
@@ -75,6 +101,8 @@ public sealed record ScanOptions
     public int MaxDepth { get; init; } = 256;
     public int MaxRecordedErrors { get; init; } = 100;
     public int EnumerationBufferSize { get; init; } = 16 * 1024;
+    public int MaxRecordedExclusions { get; init; } = 1000;
+    public int MaxTrackedDirectoryNames { get; init; } = 4096;
     public DeferralPolicy Deferral { get; init; } = new();
 
     public void Validate(string rootPath)
@@ -94,7 +122,14 @@ public sealed record ScanOptions
             throw new ArgumentOutOfRangeException(nameof(MaxRecordedErrors));
         if (EnumerationBufferSize is <= 0 or > 1024 * 1024)
             throw new ArgumentOutOfRangeException(nameof(EnumerationBufferSize));
+        if (MaxRecordedExclusions is < 0 or > 10000)
+            throw new ArgumentOutOfRangeException(nameof(MaxRecordedExclusions));
+        if (MaxTrackedDirectoryNames is < 0 or > 100000)
+            throw new ArgumentOutOfRangeException(nameof(MaxTrackedDirectoryNames));
         ArgumentNullException.ThrowIfNull(ExcludedDirectoryNames);
+        ArgumentNullException.ThrowIfNull(ExcludedDirectoryNameRegexes);
+        foreach (var rule in ExcludedDirectoryNameRegexes)
+            _ = ExclusionMatcher.Compile(rule);
         ArgumentNullException.ThrowIfNull(ExcludedPaths);
         ArgumentNullException.ThrowIfNull(ExcludedFilePatterns);
         foreach (var name in ExcludedDirectoryNames)

@@ -146,6 +146,12 @@
           "xunit.extensibility.core": "[2.9.3]"
         }
       },
+      "findeverything.cli": {
+        "type": "Project",
+        "dependencies": {
+          "FindEverything.Engine": "[1.0.0, )"
+        }
+      },
       "findeverything.engine": {
         "type": "Project",
         "dependencies": {

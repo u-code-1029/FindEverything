@@ -25,7 +25,10 @@ internal static class Program
 
         scan --root PATH --database PATH [options]
           --scope PATH                    Refresh only this subtree of the root.
+          --config PATH                   Load ScanOptions JSON; CLI lists append, scalars override.
           --exclude-dir NAME              Skip directories with this name; repeatable.
+          --exclude-dir-regex REGEX        Skip full directory-name regex matches; repeatable.
+          --exclude-dir-regex-partial REGEX Skip partial directory-name regex matches; repeatable.
           --exclude-path PATH             Skip this path and its subtree; repeatable.
           --exclude-file PATTERN          Skip filenames matching a wildcard; repeatable.
           --defer-dir NAME                Leave this directory's contents pending; repeatable.
@@ -62,7 +65,11 @@ internal static class Program
         subtree scans; first scans with unknown costs need explicit deferral rules or budgets.
         Time budgets are cooperative and cannot interrupt a stalled SMB operation.
         On-demand scans retain permanent exclusions, rate limits, and link checks. The CLI does
-        not persist exclusion policy: repeat the same exclusion options for every scan.
+        not persist exclusion policy: reuse --config or repeat exclusions for every scan.
+        JSON paths are relative to the config file; CLI paths are relative to the working directory.
+        Regexes match directory names only, use host case semantics unless JSON overrides them,
+        and time out after 100ms per match. Invalid regexes or timeouts never publish a scan.
+        Scan diagnostics include bounded excluded paths, exclusion counts and repeated folder names.
         Use a database on the indexer's local disk, outside the scanned source tree.
         Search and pending only query an existing index; neither scans nor creates a database.
         JSON results go to stdout; progress and errors go to stderr. Ctrl+C cancels.
@@ -113,7 +120,8 @@ internal static class Program
 
     private static readonly HashSet<string> ScanOptionNames = new(StringComparer.Ordinal)
     {
-        "--root", "--database", "--scope", "--exclude-dir", "--exclude-path", "--exclude-file",
+        "--root", "--database", "--scope", "--config", "--exclude-dir", "--exclude-path", "--exclude-file",
+        "--exclude-dir-regex", "--exclude-dir-regex-partial",
         "--max-entries-per-second", "--directory-delay-ms", "--defer-dir", "--defer-path",
         "--defer-over-entries", "--defer-over-seconds", "--entry-budget", "--time-budget-seconds", "--on-demand"
     };
@@ -151,7 +159,8 @@ internal static class Program
             var value = args[++index];
             if (options.TryGetValue(name, out var values))
             {
-                if (name is not ("--exclude-dir" or "--exclude-path" or "--exclude-file" or "--defer-dir" or "--defer-path"))
+                if (name is not ("--exclude-dir" or "--exclude-path" or "--exclude-file" or "--defer-dir" or "--defer-path"
+                    or "--exclude-dir-regex" or "--exclude-dir-regex-partial"))
                     throw new ArgumentException($"Option '{name}' must appear only once.");
                 values.Add(value);
             }
@@ -167,25 +176,31 @@ internal static class Program
     {
         var rootPath = RequiredPath(options, "--root");
         var databasePath = RequiredPath(options, "--database");
+        var configured = await ScanConfiguration.LoadAsync(OptionalPath(options, "--config"), rootPath, cancellationToken);
         var request = new ScanRequest(rootPath)
         {
             ScopePath = OptionalPath(options, "--scope"),
             OnDemand = options.ContainsKey("--on-demand"),
-            Options = new ScanOptions
+            Options = configured with
             {
-                ExcludedDirectoryNames = RepeatedValues(options, "--exclude-dir"),
-                ExcludedPaths = RepeatedValues(options, "--exclude-path").Select(Path.GetFullPath).ToArray(),
-                ExcludedFilePatterns = RepeatedValues(options, "--exclude-file"),
-                MaxEntriesPerSecond = Integer(options, "--max-entries-per-second", 2000, 1),
-                DirectoryDelay = TimeSpan.FromMilliseconds(Integer(options, "--directory-delay-ms", 5, 0)),
-                Deferral = new DeferralPolicy
+                ExcludedDirectoryNames = [.. configured.ExcludedDirectoryNames, .. RepeatedValues(options, "--exclude-dir")],
+                ExcludedDirectoryNameRegexes = [.. configured.ExcludedDirectoryNameRegexes,
+                    .. RepeatedValues(options, "--exclude-dir-regex").Select(pattern => new DirectoryNameRegex { Pattern = pattern }),
+                    .. RepeatedValues(options, "--exclude-dir-regex-partial").Select(pattern => new DirectoryNameRegex
+                        { Pattern = pattern, MatchMode = RegexMatchMode.Partial })],
+                ExcludedPaths = [.. configured.ExcludedPaths, .. RepeatedValues(options, "--exclude-path").Select(Path.GetFullPath)],
+                ExcludedFilePatterns = [.. configured.ExcludedFilePatterns, .. RepeatedValues(options, "--exclude-file")],
+                MaxEntriesPerSecond = Integer(options, "--max-entries-per-second", configured.MaxEntriesPerSecond, 1),
+                DirectoryDelay = options.ContainsKey("--directory-delay-ms")
+                    ? TimeSpan.FromMilliseconds(Integer(options, "--directory-delay-ms", 5, 0)) : configured.DirectoryDelay,
+                Deferral = configured.Deferral with
                 {
-                    DirectoryNames = RepeatedValues(options, "--defer-dir"),
-                    Paths = RepeatedValues(options, "--defer-path").Select(Path.GetFullPath).ToArray(),
-                    HistoricalEntryThreshold = PositiveLong(options, "--defer-over-entries"),
-                    HistoricalDurationThreshold = PositiveDuration(options, "--defer-over-seconds"),
-                    EntryBudget = PositiveLong(options, "--entry-budget"),
-                    TimeBudget = PositiveDuration(options, "--time-budget-seconds")
+                    DirectoryNames = [.. configured.Deferral.DirectoryNames, .. RepeatedValues(options, "--defer-dir")],
+                    Paths = [.. configured.Deferral.Paths, .. RepeatedValues(options, "--defer-path").Select(Path.GetFullPath)],
+                    HistoricalEntryThreshold = PositiveLong(options, "--defer-over-entries") ?? configured.Deferral.HistoricalEntryThreshold,
+                    HistoricalDurationThreshold = PositiveDuration(options, "--defer-over-seconds") ?? configured.Deferral.HistoricalDurationThreshold,
+                    EntryBudget = PositiveLong(options, "--entry-budget") ?? configured.Deferral.EntryBudget,
+                    TimeBudget = PositiveDuration(options, "--time-budget-seconds") ?? configured.Deferral.TimeBudget
                 }
             }
         };

@@ -27,9 +27,7 @@ public static class RefreshPlanner
         options ??= new ScanOptions();
         options.Validate(root);
 
-        var excludedPaths = new HashSet<string>(
-            options.ExcludedPaths.Select(PathRules.Normalize), PathRules.Comparer);
-        var excludedNames = new HashSet<string>(options.ExcludedDirectoryNames, PathRules.Comparer);
+        var exclusions = new ExclusionMatcher(options);
         var candidates = new Dictionary<string, string>(PathRules.Comparer);
 
         foreach (var input in dirtyDirectoryPaths)
@@ -37,7 +35,7 @@ public static class RefreshPlanner
             var path = PathRules.Normalize(input);
             if (!PathRules.IsWithin(path, root))
                 throw new ArgumentException("Invalidated directories must be within the source root.", nameof(dirtyDirectoryPaths));
-            if (IsExcluded(path))
+            if (exclusions.MatchScope(path, root) is not null)
                 continue;
 
             // Choose an ordinal representative when the host treats differently cased paths as
@@ -63,16 +61,6 @@ public static class RefreshPlanner
 
         scopes.Sort(PathRules.Comparer);
         return scopes.Select(scope => new ScanRequest(root) { ScopePath = scope, Options = options }).ToArray();
-
-        bool IsExcluded(string path)
-        {
-            for (string? current = path; current is not null; current = ParentWithinRoot(current))
-            {
-                if (excludedPaths.Contains(current) || excludedNames.Contains(Path.GetFileName(current)))
-                    return true;
-            }
-            return false;
-        }
 
         string? ParentWithinRoot(string path) => PathRules.Comparer.Equals(path, root)
             ? null : Path.GetDirectoryName(path);

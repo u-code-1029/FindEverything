@@ -41,6 +41,7 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
         var errors = new List<ScanError>();
         var pending = new List<PendingScope>();
         var costs = new List<DirectoryScanCost>(64);
+        var diagnostics = new ScanDiagnosticsCollector(settings.Options);
         long entries = 0, directories = 0, excluded = 0, links = 0, errorCount = 0;
         long deferralGeneration = 0;
         var stopRequested = false;
@@ -201,9 +202,10 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
             cancellationToken.ThrowIfCancellationRequested();
             // Check all configured ancestors before opening a scoped refresh. A scope under an
             // excluded folder must not bypass pruning just because its parent isn't enumerated.
-            if (settings.IsScopeExcluded(scope, root))
+            if (settings.Exclusions.MatchScope(scope, root) is { } excludedScope)
             {
                 excluded++;
+                diagnostics.Exclude(excludedScope);
             }
             else if (settings.GetDeferral(scope, root, checkAncestors: true) is { } deferredScope)
             {
@@ -249,6 +251,7 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
 
                     if (scopeEntry is not null)
                     {
+                        diagnostics.ObserveDirectory(scopeEntry.FullPath, scopeEntry.Name);
                         entries++;
                         sinceThrottle++;
                         await ThrottleAsync().ConfigureAwait(false);
@@ -295,9 +298,12 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
                     sinceThrottle++;
                     await ThrottleAsync().ConfigureAwait(false);
                     ReportProgress();
-                    if (item.Excluded)
+                    if (item.Kind == EntryKind.Directory)
+                        diagnostics.ObserveDirectory(item.Path, item.Name);
+                    if (item.Exclusion is { } exclusion)
                     {
                         excluded++;
+                        diagnostics.Exclude(exclusion);
                         continue;
                     }
                     if (item.IsLink)
@@ -371,14 +377,16 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
         ReportProgress(force: true);
         return new ScanReport(scanId, root, scope, status, Snapshot(), errors.AsReadOnly())
         {
-            PendingScopes = pending.AsReadOnly()
+            PendingScopes = pending.AsReadOnly(),
+            Diagnostics = diagnostics.Snapshot()
         };
     }
 
     private static bool IsFileSystemError(Exception exception) =>
         exception is IOException or UnauthorizedAccessException or SecurityException;
 
-    private readonly record struct ScanItem(IndexedEntry? Entry, bool Excluded, bool IsLink);
+    private readonly record struct ScanItem(string Path, string Name, EntryKind Kind,
+        IndexedEntry? Entry, ExcludedEntry? Exclusion, bool IsLink);
 
     private sealed class DirectoryFrame(string path, int depth, IEnumerator<ScanItem> enumerator,
         long startingEntries, long startingErrors, long startingDeferrals, TimeSpan started) : IDisposable
@@ -393,33 +401,23 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
         public void Dispose() => Enumerator.Dispose();
     }
 
-    private sealed class Settings(ScanOptions options, HashSet<string> directoryNames,
-        string[] paths, string[] filePatterns, HashSet<string> deferredNames, string[] deferredPaths,
+    private sealed class Settings(ScanOptions options, ExclusionMatcher exclusions,
+        HashSet<string> deferredNames, string[] deferredPaths,
         IReadOnlyDictionary<string, DirectoryScanCost> costHints, bool onDemand)
     {
         public ScanOptions Options { get; } = options;
+        public ExclusionMatcher Exclusions { get; } = exclusions;
         public bool OnDemand { get; } = onDemand;
 
         public static Settings Create(ScanOptions options, string root,
             IReadOnlyDictionary<string, DirectoryScanCost> costHints, bool onDemand)
         {
             options.Validate(root);
-            var names = options.ExcludedDirectoryNames.ToArray();
-            var patterns = options.ExcludedFilePatterns.ToArray();
-            var normalizedPaths = options.ExcludedPaths.Select(PathRules.Normalize)
-                .Distinct(PathRules.Comparer).ToArray();
             var deferredPaths = options.Deferral.Paths.Select(PathRules.Normalize)
                 .Distinct(PathRules.Comparer).ToArray();
-            return new Settings(options, new HashSet<string>(names, PathRules.Comparer), normalizedPaths, patterns,
+            return new Settings(options, new ExclusionMatcher(options),
                 new HashSet<string>(options.Deferral.DirectoryNames, PathRules.Comparer), deferredPaths,
                 costHints, onDemand);
-        }
-
-        public bool IsScopeExcluded(string scope, string root)
-        {
-            if (paths.Any(path => PathRules.IsWithin(scope, path)))
-                return true;
-            return HasAncestorName(scope, root, directoryNames);
         }
 
         public PendingScope MakePending(string path, string root, DeferralReason reason)
@@ -469,22 +467,20 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
             var path = entry.ToFullPath();
             var name = entry.FileName.ToString();
             var directory = entry.IsDirectory;
+            var kind = directory ? EntryKind.Directory : EntryKind.File;
             var attributes = entry.Attributes;
-            if (paths.Any(excludedPath => PathRules.IsWithin(path, excludedPath))
-                || (directory && directoryNames.Contains(name))
-                || (!directory && filePatterns.Any(pattern =>
-                    FileSystemName.MatchesSimpleExpression(pattern, name, OperatingSystem.IsWindows()))))
-                return new ScanItem(null, Excluded: true, IsLink: false);
+            if (Exclusions.Match(path, name, kind) is { } exclusion)
+                return new ScanItem(path, name, kind, null, exclusion, IsLink: false);
 
             if ((attributes & FileAttributes.ReparsePoint) != 0)
-                return new ScanItem(null, Excluded: false, IsLink: true);
+                return new ScanItem(path, name, kind, null, null, IsLink: true);
 
             // On Windows these fields come from native directory enumeration data, avoiding
             // FileInfo construction and additional metadata requests for every file.
-            return new ScanItem(new IndexedEntry(path, name, entry.Directory.ToString(),
-                directory ? EntryKind.Directory : EntryKind.File,
+            return new ScanItem(path, name, kind, new IndexedEntry(path, name, entry.Directory.ToString(),
+                kind,
                 directory ? null : entry.Length, entry.CreationTimeUtc, entry.LastWriteTimeUtc),
-                Excluded: false, IsLink: false);
+                null, IsLink: false);
         }
 
     }
