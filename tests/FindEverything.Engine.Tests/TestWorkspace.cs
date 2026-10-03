@@ -13,7 +13,7 @@ internal sealed class TestWorkspace : IDisposable
 
     public string WriteFile(string relativePath, string contents = "test contents")
     {
-        var path = Path.Combine(SourcePath, relativePath);
+        var path = Path.GetFullPath(Path.Combine(SourcePath, relativePath));
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, contents);
         return path;

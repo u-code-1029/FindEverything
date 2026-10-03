@@ -6,7 +6,7 @@
 - xUnit 통합·회귀 테스트: 128개 통과, 0개 실패, Windows·Linux 전용 검사 5개 건너뜀.
 - 기존 보류·요청 시 탐색, 오류·취소 시 색인 보존, schema 1 읽기·schema 2 이전 테스트 통과.
 - 이전 Linux 검증의 NuGet 취약성 검사에서는 사용한 소스 기준 알려진 취약 패키지가 없었습니다.
-- 이번 변경의 Windows·Ubuntu 원격 CI 결과는 아직 확인하지 않았습니다.
+- Windows·Ubuntu CI에서 같은 잠금파일 복원·Release 빌드·테스트를 실행합니다.
 
 ## Regex·JSON 설정·스캔 진단 검증
 
@@ -19,6 +19,8 @@
 - 관찰한 반복 폴더 이름만 집계, 제외 폴더 내부 미열거, 경로·이름 한도와 생략 건수, 이름별 최대 3개 예시, 스캔 간 통계 초기화.
 
 macOS의 `/var` 심볼릭 링크를 테스트 경로로 사용하지 않도록 `TMPDIR=/private/tmp`에서 테스트했습니다. Windows·Linux 전용 검사는 해당 플랫폼의 CI에서 별도로 실행해야 합니다.
+
+Windows CI에서 기존 `TestWorkspace.WriteFile`이 혼합된 경로 구분자를 반환해 색인의 정규화된 경로와 문자열 비교가 실패하는 문제를 확인했습니다. 테스트 도우미도 `Path.GetFullPath`로 경로를 정규화하도록 수정했습니다.
 
 ## CLI 기능 검증
 
