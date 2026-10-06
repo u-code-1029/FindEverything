@@ -1,6 +1,8 @@
 namespace FindEverything.Engine;
 
 public enum EntryKind { File, Directory }
+public enum EntrySortField { Name, Path, Kind, Size, Created, Modified }
+public enum SortDirection { Ascending, Descending }
 public enum ScanStatus { Completed, Partial, Cancelled, Deferred }
 public enum DeferralReason { ExplicitRule, HistoricalEntryCount, HistoricalDuration, EntryBudget, TimeBudget, PendingLimit }
 public enum RegexMatchMode { Full, Partial }
@@ -164,21 +166,40 @@ public sealed record ScanRequest(string RootPath)
 
 public sealed record SearchQuery
 {
+    // Whitespace-delimited literal terms. Every term must occur in either the
+    // entry name or its full path; matching is case-insensitive.
+    public string? SearchText { get; init; }
+    // Retained for callers that need the original filename-only substring filter.
     public string? NameContains { get; init; }
     public string? RootPath { get; init; }
     public EntryKind? Kind { get; init; }
+    public long? MinSizeBytes { get; init; }
+    public long? MaxSizeBytes { get; init; }
     public DateTimeOffset? CreatedFromUtc { get; init; }
     public DateTimeOffset? CreatedBeforeUtc { get; init; }
     public DateTimeOffset? ModifiedFromUtc { get; init; }
     public DateTimeOffset? ModifiedBeforeUtc { get; init; }
+    public EntrySortField SortBy { get; init; } = EntrySortField.Name;
+    public SortDirection SortDirection { get; init; } = SortDirection.Ascending;
     public int Limit { get; init; } = 100;
     public int Offset { get; init; }
 }
 
 public sealed record SearchResult(IReadOnlyList<IndexedEntry> Entries, bool HasMore)
 {
+    public long TotalCount { get; init; }
     public bool HasPendingScopes { get; init; }
 }
+
+public sealed record IndexRootStatus(
+    string RootPath,
+    Guid? LastScanId,
+    string? LastScopePath,
+    ScanStatus? LastStatus,
+    DateTimeOffset? LastPublishedUtc,
+    long EntryCount,
+    long LastErrorCount,
+    bool HasPendingScopes);
 
 public sealed record PendingQuery
 {
@@ -210,5 +231,6 @@ public interface IIndexStore : IAsyncDisposable
     Task PublishAsync(ScanReport report, CancellationToken cancellationToken = default);
     Task DiscardAsync(Guid scanId, CancellationToken cancellationToken = default);
     Task<SearchResult> SearchAsync(SearchQuery query, CancellationToken cancellationToken = default);
+    Task<IndexRootStatus?> GetRootStatusAsync(string rootPath, CancellationToken cancellationToken = default);
     Task<PendingResult> ListPendingAsync(PendingQuery query, CancellationToken cancellationToken = default);
 }

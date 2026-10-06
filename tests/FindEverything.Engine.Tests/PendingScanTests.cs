@@ -660,7 +660,7 @@ public sealed class PendingScanTests
         await connection.OpenAsync();
         await using var version = connection.CreateCommand();
         version.CommandText = "PRAGMA user_version;";
-        Assert.Equal(2L, await version.ExecuteScalarAsync());
+        Assert.Equal(3L, await version.ExecuteScalarAsync());
     }
 
     private static async Task CreateLegacyIndexAsync(TestWorkspace workspace, string file)

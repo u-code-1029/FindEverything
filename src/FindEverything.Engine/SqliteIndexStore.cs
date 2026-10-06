@@ -10,7 +10,7 @@ namespace FindEverything.Engine;
 public sealed class SqliteIndexStore : IIndexStore
 {
     private const int ApplicationId = 0x46455631; // FEV1: never initialize an unrelated SQLite file.
-    private const int SchemaVersion = 2;
+    private const int SchemaVersion = 3;
     private const int MaximumWriteBatch = 512;
     private readonly SemaphoreSlim _writerSemaphore = new(1, 1);
     private readonly SemaphoreSlim _writeGate = new(1, 1);
@@ -93,14 +93,22 @@ public sealed class SqliteIndexStore : IIndexStore
                 ValidateOwnedHeader();
 
             await using var connection = await OpenAsync(readOnly: false, cancellationToken).ConfigureAwait(false);
-            if (exists)
-                await ValidateSchemaAsync(connection, cancellationToken).ConfigureAwait(false);
+            var existingVersion = exists
+                ? await ValidateSchemaAsync(connection, cancellationToken).ConfigureAwait(false)
+                : 0;
 
             await ExecuteAsync(connection, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
             await using (var transaction = connection.BeginTransaction())
             {
+                if (existingVersion == 1)
+                    await ExecuteAsync(connection, SchemaV2Sql, cancellationToken, transaction).ConfigureAwait(false);
+                if (existingVersion is 1 or 2)
+                {
+                    await ExecuteAsync(connection, MigrationV3ColumnsSql, cancellationToken, transaction).ConfigureAwait(false);
+                    await PopulatePathSearchAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+                    await ExecuteAsync(connection, MigrationV3SearchSql, cancellationToken, transaction).ConfigureAwait(false);
+                }
                 await ExecuteAsync(connection, SchemaSql, cancellationToken, transaction).ConfigureAwait(false);
-                await EnsureNameUpdateTriggerAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
                 // Holding the sole writer lease makes abandoned staging rows safe to remove.
                 await ExecuteAsync(connection, "DELETE FROM scans;", cancellationToken, transaction).ConfigureAwait(false);
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -171,12 +179,12 @@ public sealed class SqliteIndexStore : IIndexStore
                 await using var command = connection.CreateCommand();
                 command.Transaction = transaction;
                 command.CommandText = """
-                    INSERT INTO staging(scan_id, path_key, full_path, name, name_search,
+                    INSERT INTO staging(scan_id, path_key, full_path, path_search, name, name_search,
                         parent_path, kind, size_bytes, created_ticks, modified_ticks)
-                    VALUES($scan, $pathKey, $path, $name, $nameSearch,
+                    VALUES($scan, $pathKey, $path, $pathSearch, $name, $nameSearch,
                         $parent, $kind, $size, $created, $modified)
                     ON CONFLICT(scan_id, path_key) DO UPDATE SET
-                        full_path=excluded.full_path, name=excluded.name,
+                        full_path=excluded.full_path, path_search=excluded.path_search, name=excluded.name,
                         name_search=excluded.name_search, parent_path=excluded.parent_path,
                         kind=excluded.kind, size_bytes=excluded.size_bytes,
                         created_ticks=excluded.created_ticks, modified_ticks=excluded.modified_ticks;
@@ -184,6 +192,7 @@ public sealed class SqliteIndexStore : IIndexStore
                 command.Parameters.AddWithValue("$scan", scanId.ToString("N"));
                 var pathKeyParameter = command.Parameters.Add("$pathKey", SqliteType.Text);
                 var pathParameter = command.Parameters.Add("$path", SqliteType.Text);
+                var pathSearchParameter = command.Parameters.Add("$pathSearch", SqliteType.Text);
                 var nameParameter = command.Parameters.Add("$name", SqliteType.Text);
                 var searchParameter = command.Parameters.Add("$nameSearch", SqliteType.Text);
                 var parentParameter = command.Parameters.Add("$parent", SqliteType.Text);
@@ -210,6 +219,7 @@ public sealed class SqliteIndexStore : IIndexStore
 
                     pathKeyParameter.Value = pathKey;
                     pathParameter.Value = path;
+                    pathSearchParameter.Value = path.ToLowerInvariant();
                     nameParameter.Value = entry.Name;
                     searchParameter.Value = entry.Name.ToLowerInvariant();
                     parentParameter.Value = PathRules.Normalize(entry.ParentPath);
@@ -366,16 +376,18 @@ public sealed class SqliteIndexStore : IIndexStore
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = """
-                INSERT INTO entries(root_key, path_key, full_path, name, name_search,
+                INSERT INTO entries(root_key, path_key, full_path, path_search, name, name_search,
                     parent_path, kind, size_bytes, created_ticks, modified_ticks)
-                SELECT $root, path_key, full_path, name, name_search,
+                SELECT $root, path_key, full_path, path_search, name, name_search,
                     parent_path, kind, size_bytes, created_ticks, modified_ticks
                 FROM staging WHERE scan_id=$scan
                 ON CONFLICT(root_key, path_key) DO UPDATE SET
-                    full_path=excluded.full_path, name=excluded.name, name_search=excluded.name_search,
+                    full_path=excluded.full_path, path_search=excluded.path_search,
+                    name=excluded.name, name_search=excluded.name_search,
                     parent_path=excluded.parent_path, kind=excluded.kind, size_bytes=excluded.size_bytes,
                     created_ticks=excluded.created_ticks, modified_ticks=excluded.modified_ticks
-                WHERE entries.full_path IS NOT excluded.full_path OR entries.name IS NOT excluded.name
+                WHERE entries.full_path IS NOT excluded.full_path
+                    OR entries.path_search IS NOT excluded.path_search OR entries.name IS NOT excluded.name
                     OR entries.parent_path IS NOT excluded.parent_path OR entries.kind IS NOT excluded.kind
                     OR entries.size_bytes IS NOT excluded.size_bytes
                     OR entries.created_ticks IS NOT excluded.created_ticks
@@ -472,8 +484,18 @@ public sealed class SqliteIndexStore : IIndexStore
             throw new ArgumentOutOfRangeException(nameof(query), "Limit must be 1–1000 and offset must be nonnegative.");
         if (query.Kind is { } kind && !Enum.IsDefined(kind))
             throw new ArgumentException("Unknown entry kind.", nameof(query));
+        if (!Enum.IsDefined(query.SortBy) || !Enum.IsDefined(query.SortDirection))
+            throw new ArgumentException("Unknown search sort option.", nameof(query));
+        if (query.MinSizeBytes is < 0 || query.MaxSizeBytes is < 0
+            || query.MinSizeBytes > query.MaxSizeBytes)
+            throw new ArgumentException("Size bounds must be nonnegative and the minimum cannot exceed the maximum.", nameof(query));
         ValidateDateRange(query.CreatedFromUtc, query.CreatedBeforeUtc);
         ValidateDateRange(query.ModifiedFromUtc, query.ModifiedBeforeUtc);
+        var rootKey = query.RootPath is null ? null : PathRules.Key(query.RootPath);
+        var terms = NormalizeSearchTerms(query.SearchText);
+        var normalizedName = string.IsNullOrEmpty(query.NameContains)
+            ? null
+            : query.NameContains.ToLowerInvariant();
         EnsureReadableIndex();
 
         await using var connection = await OpenAsync(true, cancellationToken).ConfigureAwait(false);
@@ -487,55 +509,36 @@ public sealed class SqliteIndexStore : IIndexStore
             pendingCommand.CommandText = query.RootPath is null
                 ? "SELECT 1 FROM pending_scopes LIMIT 1;"
                 : "SELECT 1 FROM pending_scopes WHERE root_key=$root LIMIT 1;";
-            if (query.RootPath is not null)
-                pendingCommand.Parameters.AddWithValue("$root", PathRules.Key(query.RootPath));
+            if (rootKey is not null)
+                pendingCommand.Parameters.AddWithValue("$root", rootKey);
             hasPending = await pendingCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
         }
+
+        await using var countCommand = connection.CreateCommand();
+        countCommand.Transaction = transaction;
+        var countPredicates = AddSearchPredicates(countCommand, query, version, rootKey, terms, normalizedName);
+        var countWhere = countPredicates.Count == 0 ? "" : "WHERE " + string.Join(" AND ", countPredicates);
+        countCommand.CommandText = $"SELECT COUNT(*) FROM entries e {countWhere};";
+        var totalCount = Convert.ToInt64(await countCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        var predicates = new List<string>();
-        var normalizedName = query.NameContains?.ToLowerInvariant();
-        if (!string.IsNullOrEmpty(normalizedName))
-        {
-            // FTS produces candidates; INSTR verifies the literal Unicode substring, without
-            // treating a user's *, quotation marks, %, or _ as query syntax or wildcards.
-            if (normalizedName.EnumerateRunes().Count() >= 3)
-            {
-                predicates.Add("e.id IN (SELECT rowid FROM entry_names WHERE entry_names MATCH $match)");
-                command.Parameters.AddWithValue("$match", "\"" + normalizedName.Replace("\"", "\"\"") + "\"");
-            }
-            predicates.Add("instr(e.name_search, $name) > 0");
-            command.Parameters.AddWithValue("$name", normalizedName);
-        }
-
-        if (query.RootPath is not null)
-        {
-            predicates.Add("e.root_key=$root");
-            command.Parameters.AddWithValue("$root", PathRules.Key(query.RootPath));
-        }
-        if (query.Kind is not null)
-        {
-            predicates.Add("e.kind=$kind");
-            command.Parameters.AddWithValue("$kind", (int)query.Kind.Value);
-        }
-        AddDatePredicate(command, predicates, "created_ticks", ">=", "$createdFrom", query.CreatedFromUtc);
-        AddDatePredicate(command, predicates, "created_ticks", "<", "$createdBefore", query.CreatedBeforeUtc);
-        AddDatePredicate(command, predicates, "modified_ticks", ">=", "$modifiedFrom", query.ModifiedFromUtc);
-        AddDatePredicate(command, predicates, "modified_ticks", "<", "$modifiedBefore", query.ModifiedBeforeUtc);
+        var predicates = AddSearchPredicates(command, query, version, rootKey, terms, normalizedName);
         var where = predicates.Count == 0 ? "" : "WHERE " + string.Join(" AND ", predicates);
         var coverage = version < 2 ? "0" : """
             EXISTS(SELECT 1 FROM pending_scopes p WHERE p.root_key=e.root_key
                 AND (e.path_key=p.path_key OR (e.path_key >= p.lower_bound AND e.path_key < p.upper_bound)))
             """;
+        var orderBy = BuildOrderBy(query.SortBy, query.SortDirection, version);
         command.CommandText = $"""
             SELECT e.full_path, e.name, e.parent_path, e.kind, e.size_bytes,
                 e.created_ticks, e.modified_ticks, {coverage} FROM entries e {where}
-            ORDER BY e.name_search COLLATE BINARY, e.full_path COLLATE BINARY, e.root_key COLLATE BINARY
+            ORDER BY {orderBy}
             LIMIT $limit OFFSET $offset;
             """;
-        command.Parameters.AddWithValue("$limit", query.Limit + 1);
+        command.Parameters.AddWithValue("$limit", query.Limit);
         command.Parameters.AddWithValue("$offset", query.Offset);
-        var entries = new List<IndexedEntry>(query.Limit + 1);
+        var entries = new List<IndexedEntry>(query.Limit);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -545,10 +548,60 @@ public sealed class SqliteIndexStore : IIndexStore
                 new DateTimeOffset(reader.GetInt64(6), TimeSpan.Zero)) { CoveragePending = reader.GetBoolean(7) });
         }
 
-        var hasMore = entries.Count > query.Limit;
-        if (hasMore)
-            entries.RemoveAt(entries.Count - 1);
-        return new SearchResult(entries.AsReadOnly(), hasMore) { HasPendingScopes = hasPending };
+        var hasMore = query.Offset + (long)entries.Count < totalCount;
+        return new SearchResult(entries.AsReadOnly(), hasMore)
+        {
+            TotalCount = totalCount,
+            HasPendingScopes = hasPending
+        };
+    }
+
+    public async Task<IndexRootStatus?> GetRootStatusAsync(string rootPath,
+        CancellationToken cancellationToken = default)
+    {
+        var rootKey = PathRules.Key(rootPath);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        EnsureReadableIndex();
+        await using var connection = await OpenAsync(true, cancellationToken).ConfigureAwait(false);
+        await using var transaction = connection.BeginTransaction(deferred: true);
+        var version = await ValidateSchemaAsync(connection, cancellationToken, transaction).ConfigureAwait(false);
+        var pending = version < 2 ? "0" :
+            "EXISTS(SELECT 1 FROM pending_scopes p WHERE p.root_key=r.root_key)";
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"""
+            SELECT r.root_path, r.last_scan_id, r.last_scope_path, r.last_status,
+                r.last_published_ticks,
+                (SELECT COUNT(*) FROM entries e WHERE e.root_key=r.root_key),
+                COALESCE(r.last_errors, 0), {pending}
+            FROM roots r
+            WHERE r.root_key=$root AND r.last_published_ticks IS NOT NULL;
+            """;
+        command.Parameters.AddWithValue("$root", rootKey);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            return null;
+
+        Guid? scanId = null;
+        if (!reader.IsDBNull(1))
+        {
+            var text = reader.GetString(1);
+            if (!Guid.TryParseExact(text, "N", out var parsed))
+                throw new InvalidDataException("The index contains an invalid last scan identifier.");
+            scanId = parsed;
+        }
+        ScanStatus? status = null;
+        if (!reader.IsDBNull(3))
+        {
+            var value = reader.GetInt32(3);
+            if (!Enum.IsDefined((ScanStatus)value))
+                throw new InvalidDataException("The index contains an invalid last scan status.");
+            status = (ScanStatus)value;
+        }
+        return new IndexRootStatus(
+            reader.GetString(0), scanId, reader.IsDBNull(2) ? null : reader.GetString(2), status,
+            reader.IsDBNull(4) ? null : new DateTimeOffset(reader.GetInt64(4), TimeSpan.Zero),
+            reader.GetInt64(5), reader.GetInt64(6), reader.GetBoolean(7));
     }
 
     public async Task<PendingResult> ListPendingAsync(PendingQuery query, CancellationToken cancellationToken = default)
@@ -691,21 +744,6 @@ public sealed class SqliteIndexStore : IIndexStore
             throw new ArgumentException("The SQLite index must be on a local disk, not a mapped network drive.", nameof(DatabasePath));
     }
 
-    private static async Task EnsureNameUpdateTriggerAsync(SqliteConnection connection,
-        SqliteTransaction transaction, CancellationToken cancellationToken)
-    {
-        await using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText = "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='entries_update';";
-        var sql = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
-        if (sql?.Contains("AFTER UPDATE OF name_search", StringComparison.Ordinal) == true
-            && sql.Contains("WHEN old.name_search IS NOT new.name_search", StringComparison.Ordinal))
-            return;
-        // Upgrade the original trigger without rebuilding the FTS index or changing rows.
-        await ExecuteAsync(connection, "DROP TRIGGER IF EXISTS entries_update;", cancellationToken, transaction).ConfigureAwait(false);
-        await ExecuteAsync(connection, NameUpdateTriggerSql, cancellationToken, transaction).ConfigureAwait(false);
-    }
-
     private void ValidateOwnedHeader()
     {
         using var file = new FileStream(DatabasePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -722,6 +760,9 @@ public sealed class SqliteIndexStore : IIndexStore
         try
         {
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            connection.CreateFunction<string, string>(
+                "invariant_lower",
+                static value => value.ToLowerInvariant());
             await ExecuteAsync(connection, readOnly
                 ? "PRAGMA query_only=ON; PRAGMA foreign_keys=ON;"
                 : "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
@@ -761,6 +802,15 @@ public sealed class SqliteIndexStore : IIndexStore
         command.Transaction = transaction;
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task PopulatePathSearchAsync(SqliteConnection connection,
+        SqliteTransaction transaction, CancellationToken cancellationToken)
+    {
+        await ExecuteAsync(connection, """
+            UPDATE entries SET path_search=invariant_lower(full_path);
+            UPDATE staging SET path_search=invariant_lower(full_path);
+            """, cancellationToken, transaction).ConfigureAwait(false);
     }
 
     private static async Task SweepUnseenAsync(SqliteConnection connection, SqliteTransaction transaction,
@@ -923,6 +973,94 @@ public sealed class SqliteIndexStore : IIndexStore
     // gives an exact binary upper bound, without LIKE wildcard or case-folding ambiguity.
     private static string PrefixUpperBound(string prefix) => prefix[..^1] + (char)(prefix[^1] + 1);
 
+    private static IReadOnlyList<string> NormalizeSearchTerms(string? searchText)
+    {
+        if (string.IsNullOrWhiteSpace(searchText))
+            return [];
+        return searchText.Split((char[]?)null,
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(term => term.ToLowerInvariant())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static List<string> AddSearchPredicates(SqliteCommand command, SearchQuery query,
+        int schemaVersion, string? rootKey, IReadOnlyList<string> terms, string? normalizedName)
+    {
+        var predicates = new List<string>();
+        for (var index = 0; index < terms.Count; index++)
+        {
+            var term = terms[index];
+            if (schemaVersion >= 3 && term.EnumerateRunes().Count() >= 3)
+            {
+                var matchParameter = $"$searchMatch{index}";
+                predicates.Add($"e.id IN (SELECT rowid FROM entry_search WHERE entry_search MATCH {matchParameter})");
+                command.Parameters.AddWithValue(matchParameter, FtsLiteral(term));
+            }
+            var parameter = $"$search{index}";
+            var pathSearch = schemaVersion >= 3 ? "e.path_search" : "invariant_lower(e.full_path)";
+            predicates.Add($"(instr(e.name_search, {parameter}) > 0 OR instr({pathSearch}, {parameter}) > 0)");
+            command.Parameters.AddWithValue(parameter, term);
+        }
+
+        if (normalizedName is not null)
+        {
+            if (normalizedName.EnumerateRunes().Count() >= 3)
+            {
+                var table = schemaVersion >= 3 ? "entry_search" : "entry_names";
+                predicates.Add($"e.id IN (SELECT rowid FROM {table} WHERE {table} MATCH $nameMatch)");
+                command.Parameters.AddWithValue("$nameMatch", FtsLiteral(normalizedName));
+            }
+            predicates.Add("instr(e.name_search, $name) > 0");
+            command.Parameters.AddWithValue("$name", normalizedName);
+        }
+
+        if (rootKey is not null)
+        {
+            predicates.Add("e.root_key=$root");
+            command.Parameters.AddWithValue("$root", rootKey);
+        }
+        if (query.Kind is not null)
+        {
+            predicates.Add("e.kind=$kind");
+            command.Parameters.AddWithValue("$kind", (int)query.Kind.Value);
+        }
+        if (query.MinSizeBytes is { } minimumSize)
+        {
+            predicates.Add("e.size_bytes >= $minimumSize");
+            command.Parameters.AddWithValue("$minimumSize", minimumSize);
+        }
+        if (query.MaxSizeBytes is { } maximumSize)
+        {
+            predicates.Add("e.size_bytes <= $maximumSize");
+            command.Parameters.AddWithValue("$maximumSize", maximumSize);
+        }
+        AddDatePredicate(command, predicates, "created_ticks", ">=", "$createdFrom", query.CreatedFromUtc);
+        AddDatePredicate(command, predicates, "created_ticks", "<", "$createdBefore", query.CreatedBeforeUtc);
+        AddDatePredicate(command, predicates, "modified_ticks", ">=", "$modifiedFrom", query.ModifiedFromUtc);
+        AddDatePredicate(command, predicates, "modified_ticks", "<", "$modifiedBefore", query.ModifiedBeforeUtc);
+        return predicates;
+    }
+
+    private static string FtsLiteral(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";
+
+    private static string BuildOrderBy(EntrySortField sortBy, SortDirection sortDirection, int schemaVersion)
+    {
+        var direction = sortDirection == SortDirection.Ascending ? "ASC" : "DESC";
+        var pathSearch = schemaVersion >= 3 ? "e.path_search" : "invariant_lower(e.full_path)";
+        var primary = sortBy switch
+        {
+            EntrySortField.Name => $"e.name_search COLLATE BINARY {direction}",
+            EntrySortField.Path => $"{pathSearch} COLLATE BINARY {direction}",
+            EntrySortField.Kind => $"e.kind {direction}",
+            EntrySortField.Size => $"(e.size_bytes IS NULL) ASC, e.size_bytes {direction}",
+            EntrySortField.Created => $"e.created_ticks {direction}",
+            EntrySortField.Modified => $"e.modified_ticks {direction}",
+            _ => throw new ArgumentOutOfRangeException(nameof(sortBy))
+        };
+        return $"{primary}, e.path_key COLLATE BINARY ASC, e.root_key COLLATE BINARY ASC";
+    }
+
     private static void ValidateDateRange(DateTimeOffset? from, DateTimeOffset? before)
     {
         if (from is not null && before is not null && from.Value.UtcTicks >= before.Value.UtcTicks)
@@ -949,7 +1087,7 @@ public sealed class SqliteIndexStore : IIndexStore
 
     private const string SchemaSql = """
         PRAGMA application_id=1178949169;
-        PRAGMA user_version=2;
+        PRAGMA user_version=3;
         CREATE TABLE IF NOT EXISTS roots(
             root_key TEXT PRIMARY KEY COLLATE BINARY,
             root_path TEXT NOT NULL,
@@ -966,7 +1104,8 @@ public sealed class SqliteIndexStore : IIndexStore
         CREATE TABLE IF NOT EXISTS staging(
             scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
             path_key TEXT NOT NULL COLLATE BINARY,
-            full_path TEXT NOT NULL, name TEXT NOT NULL, name_search TEXT NOT NULL,
+            full_path TEXT NOT NULL, path_search TEXT NOT NULL COLLATE BINARY,
+            name TEXT NOT NULL, name_search TEXT NOT NULL,
             parent_path TEXT NOT NULL, kind INTEGER NOT NULL CHECK(kind IN (0,1)),
             size_bytes INTEGER, created_ticks INTEGER NOT NULL, modified_ticks INTEGER NOT NULL,
             PRIMARY KEY(scan_id, path_key)
@@ -975,7 +1114,8 @@ public sealed class SqliteIndexStore : IIndexStore
             id INTEGER PRIMARY KEY,
             root_key TEXT NOT NULL REFERENCES roots(root_key) COLLATE BINARY,
             path_key TEXT NOT NULL COLLATE BINARY,
-            full_path TEXT NOT NULL, name TEXT NOT NULL, name_search TEXT NOT NULL COLLATE BINARY,
+            full_path TEXT NOT NULL, path_search TEXT NOT NULL COLLATE BINARY,
+            name TEXT NOT NULL, name_search TEXT NOT NULL COLLATE BINARY,
             parent_path TEXT NOT NULL, kind INTEGER NOT NULL CHECK(kind IN (0,1)),
             size_bytes INTEGER, created_ticks INTEGER NOT NULL, modified_ticks INTEGER NOT NULL,
             UNIQUE(root_key, path_key)
@@ -983,6 +1123,12 @@ public sealed class SqliteIndexStore : IIndexStore
         CREATE INDEX IF NOT EXISTS entries_name_order ON entries(name_search, full_path, root_key);
         CREATE INDEX IF NOT EXISTS entries_created ON entries(created_ticks);
         CREATE INDEX IF NOT EXISTS entries_modified ON entries(modified_ticks);
+        CREATE INDEX IF NOT EXISTS entries_root_name ON entries(root_key, name_search, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_path ON entries(root_key, path_search, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_kind ON entries(root_key, kind, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_size ON entries(root_key, size_bytes, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_created ON entries(root_key, created_ticks, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_modified ON entries(root_key, modified_ticks, path_key);
         CREATE TABLE IF NOT EXISTS directory_costs(
             root_key TEXT NOT NULL REFERENCES roots(root_key) COLLATE BINARY,
             path_key TEXT NOT NULL COLLATE BINARY, full_path TEXT NOT NULL,
@@ -1013,22 +1159,95 @@ public sealed class SqliteIndexStore : IIndexStore
             reason INTEGER NOT NULL, estimated_entries INTEGER, estimated_duration_ticks INTEGER,
             deferred_ticks INTEGER NOT NULL, PRIMARY KEY(scan_id, path_key)
         ) WITHOUT ROWID;
-        CREATE VIRTUAL TABLE IF NOT EXISTS entry_names USING fts5(
-            name_search, content='entries', content_rowid='id', tokenize='trigram'
+        CREATE VIRTUAL TABLE IF NOT EXISTS entry_search USING fts5(
+            name_search, path_search, content='entries', content_rowid='id', tokenize='trigram'
         );
-        CREATE TRIGGER IF NOT EXISTS entries_insert AFTER INSERT ON entries BEGIN
-            INSERT INTO entry_names(rowid, name_search) VALUES(new.id, new.name_search);
+        CREATE TRIGGER IF NOT EXISTS entries_search_insert AFTER INSERT ON entries BEGIN
+            INSERT INTO entry_search(rowid, name_search, path_search)
+                VALUES(new.id, new.name_search, new.path_search);
         END;
-        CREATE TRIGGER IF NOT EXISTS entries_delete AFTER DELETE ON entries BEGIN
-            INSERT INTO entry_names(entry_names, rowid, name_search) VALUES('delete', old.id, old.name_search);
+        CREATE TRIGGER IF NOT EXISTS entries_search_delete AFTER DELETE ON entries BEGIN
+            INSERT INTO entry_search(entry_search, rowid, name_search, path_search)
+                VALUES('delete', old.id, old.name_search, old.path_search);
+        END;
+        CREATE TRIGGER IF NOT EXISTS entries_search_update AFTER UPDATE OF name_search, path_search ON entries
+        WHEN old.name_search IS NOT new.name_search OR old.path_search IS NOT new.path_search BEGIN
+            INSERT INTO entry_search(entry_search, rowid, name_search, path_search)
+                VALUES('delete', old.id, old.name_search, old.path_search);
+            INSERT INTO entry_search(rowid, name_search, path_search)
+                VALUES(new.id, new.name_search, new.path_search);
         END;
         """;
 
-    private const string NameUpdateTriggerSql = """
-        CREATE TRIGGER entries_update AFTER UPDATE OF name_search ON entries
-        WHEN old.name_search IS NOT new.name_search BEGIN
-            INSERT INTO entry_names(entry_names, rowid, name_search) VALUES('delete', old.id, old.name_search);
-            INSERT INTO entry_names(rowid, name_search) VALUES(new.id, new.name_search);
+    private const string SchemaV2Sql = """
+        PRAGMA user_version=2;
+        CREATE TABLE IF NOT EXISTS directory_costs(
+            root_key TEXT NOT NULL REFERENCES roots(root_key) COLLATE BINARY,
+            path_key TEXT NOT NULL COLLATE BINARY, full_path TEXT NOT NULL,
+            entries INTEGER NOT NULL CHECK(entries >= 0),
+            duration_ticks INTEGER NOT NULL CHECK(duration_ticks >= 0), recorded_ticks INTEGER NOT NULL,
+            PRIMARY KEY(root_key, path_key)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS costs_entries ON directory_costs(root_key, entries);
+        CREATE INDEX IF NOT EXISTS costs_duration ON directory_costs(root_key, duration_ticks);
+        CREATE TABLE IF NOT EXISTS staged_costs(
+            scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
+            path_key TEXT NOT NULL COLLATE BINARY, full_path TEXT NOT NULL,
+            entries INTEGER NOT NULL CHECK(entries >= 0),
+            duration_ticks INTEGER NOT NULL CHECK(duration_ticks >= 0), recorded_ticks INTEGER NOT NULL,
+            PRIMARY KEY(scan_id, path_key)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS pending_scopes(
+            root_key TEXT NOT NULL REFERENCES roots(root_key) COLLATE BINARY,
+            path_key TEXT NOT NULL COLLATE BINARY, scope_path TEXT NOT NULL,
+            lower_bound TEXT NOT NULL COLLATE BINARY, upper_bound TEXT NOT NULL COLLATE BINARY,
+            reason INTEGER NOT NULL, estimated_entries INTEGER, estimated_duration_ticks INTEGER,
+            deferred_ticks INTEGER NOT NULL, PRIMARY KEY(root_key, path_key)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS staged_pending(
+            scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
+            path_key TEXT NOT NULL COLLATE BINARY, scope_path TEXT NOT NULL,
+            lower_bound TEXT NOT NULL COLLATE BINARY, upper_bound TEXT NOT NULL COLLATE BINARY,
+            reason INTEGER NOT NULL, estimated_entries INTEGER, estimated_duration_ticks INTEGER,
+            deferred_ticks INTEGER NOT NULL, PRIMARY KEY(scan_id, path_key)
+        ) WITHOUT ROWID;
+        """;
+
+    private const string MigrationV3ColumnsSql = """
+        ALTER TABLE staging ADD COLUMN path_search TEXT NOT NULL DEFAULT '' COLLATE BINARY;
+        ALTER TABLE entries ADD COLUMN path_search TEXT NOT NULL DEFAULT '' COLLATE BINARY;
+        """;
+
+    private const string MigrationV3SearchSql = """
+        DROP TRIGGER IF EXISTS entries_insert;
+        DROP TRIGGER IF EXISTS entries_delete;
+        DROP TRIGGER IF EXISTS entries_update;
+        DROP TABLE IF EXISTS entry_names;
+        CREATE INDEX IF NOT EXISTS entries_root_name ON entries(root_key, name_search, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_path ON entries(root_key, path_search, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_kind ON entries(root_key, kind, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_size ON entries(root_key, size_bytes, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_created ON entries(root_key, created_ticks, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_modified ON entries(root_key, modified_ticks, path_key);
+        CREATE VIRTUAL TABLE entry_search USING fts5(
+            name_search, path_search, content='entries', content_rowid='id', tokenize='trigram'
+        );
+        CREATE TRIGGER entries_search_insert AFTER INSERT ON entries BEGIN
+            INSERT INTO entry_search(rowid, name_search, path_search)
+                VALUES(new.id, new.name_search, new.path_search);
         END;
+        CREATE TRIGGER entries_search_delete AFTER DELETE ON entries BEGIN
+            INSERT INTO entry_search(entry_search, rowid, name_search, path_search)
+                VALUES('delete', old.id, old.name_search, old.path_search);
+        END;
+        CREATE TRIGGER entries_search_update AFTER UPDATE OF name_search, path_search ON entries
+        WHEN old.name_search IS NOT new.name_search OR old.path_search IS NOT new.path_search BEGIN
+            INSERT INTO entry_search(entry_search, rowid, name_search, path_search)
+                VALUES('delete', old.id, old.name_search, old.path_search);
+            INSERT INTO entry_search(rowid, name_search, path_search)
+                VALUES(new.id, new.name_search, new.path_search);
+        END;
+        INSERT INTO entry_search(entry_search) VALUES('rebuild');
+        PRAGMA user_version=3;
         """;
 }
