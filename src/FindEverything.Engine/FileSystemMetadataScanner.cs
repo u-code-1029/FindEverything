@@ -8,7 +8,7 @@ namespace FindEverything.Engine;
 /// Streams directory metadata without opening file contents or writing to the source.
 /// Only one traversal is active: the enumerator stack grows with depth, not directory width.
 /// </summary>
-public sealed class FileSystemMetadataScanner : IMetadataScanner
+public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDiscoveryScanner
 {
     public Task<ScanReport> ScanAsync(ScanRequest request, Guid scanId,
         Func<IReadOnlyList<IndexedEntry>, CancellationToken, Task> writeBatch,
@@ -26,14 +26,52 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
         // Native enumeration is synchronous, including SMB requests. Keep it off a WPF UI thread.
         // Do not pass the token to Task.Run: even pre-cancelled requests return a Cancelled report.
         return Task.Run(() => ScanCoreAsync(root, scope, scanId, settings,
-            writeBatch, request.WriteCosts, progress, cancellationToken));
+            writeBatch, request.WriteCosts, progress, cancellationToken,
+            discovery: null, emitEntries: true));
+    }
+
+    public Task<DirectoryDiscoveryReport> DiscoverDirectoriesAsync(
+        DirectoryDiscoveryRequest request,
+        Func<DirectoryCandidate, DirectoryTraversalDecision> inspectDirectory,
+        IProgress<DirectoryDiscoveryProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(inspectDirectory);
+        ArgumentNullException.ThrowIfNull(request.Options);
+        var root = PathRules.Normalize(request.RootPath);
+        var scope = PathRules.Normalize(request.ScopePath ?? root);
+        if (!PathRules.IsWithin(scope, root))
+            throw new ArgumentException("The discovery scope must be inside the configured root.", nameof(request));
+
+        // Discovery is an explicit, non-persistent operation. Deferral is an indexing concern,
+        // while exclusions, link checks, throttling and depth limits still apply.
+        var settings = Settings.Create(request.Options, root,
+            new Dictionary<string, DirectoryScanCost>(PathRules.Comparer), onDemand: true);
+        var discovery = new DiscoveryState(inspectDirectory, progress);
+
+        // Native enumeration is synchronous, including SMB requests. Keep it off a WPF UI thread.
+        // Do not pass the token to Task.Run: even pre-cancelled requests return a Cancelled report.
+        return Task.Run(async () =>
+        {
+            var scan = await ScanCoreAsync(root, scope, Guid.Empty, settings,
+                static (_, _) => Task.CompletedTask, writeCosts: null, progress: null,
+                cancellationToken: cancellationToken, discovery: discovery,
+                emitEntries: false).ConfigureAwait(false);
+            return new DirectoryDiscoveryReport(root, scope, scan.Status,
+                discovery.LastProgress, scan.Errors)
+            {
+                Diagnostics = scan.Diagnostics
+            };
+        });
     }
 
     private static async Task<ScanReport> ScanCoreAsync(string root, string scope,
         Guid scanId, Settings settings,
         Func<IReadOnlyList<IndexedEntry>, CancellationToken, Task> writeBatch,
         Func<IReadOnlyList<DirectoryScanCost>, CancellationToken, Task>? writeCosts,
-        IProgress<ScanProgress>? progress, CancellationToken cancellationToken)
+        IProgress<ScanProgress>? progress, CancellationToken cancellationToken,
+        DiscoveryState? discovery, bool emitEntries)
     {
         var watch = Stopwatch.StartNew();
         var frames = new Stack<DirectoryFrame>();
@@ -61,7 +99,9 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
             if (force || watch.Elapsed - lastProgress >= TimeSpan.FromMilliseconds(250))
             {
                 lastProgress = watch.Elapsed;
-                progress?.Report(Snapshot());
+                var snapshot = Snapshot();
+                progress?.Report(snapshot);
+                discovery?.Report(snapshot);
             }
         }
 
@@ -224,10 +264,46 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
                     ancestorsSafe = false;
                 }
 
-                if (ancestorsSafe)
+                var inspectScope = ancestorsSafe && discovery is not null;
+                DirectoryCandidate? scopeCandidate = null;
+                if (inspectScope)
+                {
+                    try
+                    {
+                        var info = new DirectoryInfo(scope);
+                        info.Refresh();
+                        if (!info.Exists)
+                            throw new DirectoryNotFoundException(
+                                "The discovery scope disappeared before its metadata could be read.");
+                        if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+                            throw new IOException(
+                                "The discovery scope became a reparse point before its metadata could be read.");
+                        scopeCandidate = new DirectoryCandidate(scope,
+                            string.IsNullOrEmpty(info.Name) ? scope : info.Name,
+                            info.Parent?.FullName, 0,
+                            new DateTimeOffset(info.CreationTimeUtc),
+                            new DateTimeOffset(info.LastWriteTimeUtc));
+                    }
+                    catch (Exception exception) when (IsFileSystemError(exception))
+                    {
+                        RecordError(scope, exception.Message);
+                        ancestorsSafe = false;
+                    }
+                }
+
+                var enterScope = ancestorsSafe;
+                if (scopeCandidate is not null)
+                {
+                    diagnostics.ObserveDirectory(scopeCandidate.FullPath, scopeCandidate.Name);
+                    enterScope = discovery!.Inspect(scopeCandidate);
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
+                if (enterScope)
                     await OpenDirectoryAsync(scope, 0).ConfigureAwait(false);
 
-                if (frames.Count > 0 && !PathRules.Comparer.Equals(scope, root) && !BudgetExhausted())
+                if (emitEntries && frames.Count > 0
+                    && !PathRules.Comparer.Equals(scope, root) && !BudgetExhausted())
                 {
                     IndexedEntry? scopeEntry = null;
                     try
@@ -320,14 +396,27 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
                         indexed = indexed with { CoveragePending = true };
                         Defer(deferred);
                     }
-                    batch.Add(indexed);
-                    if (batch.Count >= settings.Options.BatchSize)
+                    if (emitEntries)
                     {
-                        await writeBatch(batch.ToArray(), cancellationToken).ConfigureAwait(false);
-                        batch.Clear();
+                        batch.Add(indexed);
+                        if (batch.Count >= settings.Options.BatchSize)
+                        {
+                            await writeBatch(batch.ToArray(), cancellationToken).ConfigureAwait(false);
+                            batch.Clear();
+                        }
                     }
 
-                    if (indexed.Kind == EntryKind.Directory && deferred is null && !stopRequested)
+                    var enterDirectory = true;
+                    if (indexed.Kind == EntryKind.Directory && discovery is not null)
+                    {
+                        enterDirectory = discovery.Inspect(new DirectoryCandidate(
+                            indexed.FullPath, indexed.Name, indexed.ParentPath,
+                            frame.Depth + 1, indexed.CreatedUtc, indexed.ModifiedUtc));
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+
+                    if (indexed.Kind == EntryKind.Directory && deferred is null
+                        && enterDirectory && !stopRequested)
                     {
                         if (frame.Depth >= settings.Options.MaxDepth)
                         {
@@ -399,6 +488,43 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner
         public long StartingDeferrals { get; } = startingDeferrals;
         public TimeSpan Started { get; } = started;
         public void Dispose() => Enumerator.Dispose();
+    }
+
+    private sealed class DiscoveryState(
+        Func<DirectoryCandidate, DirectoryTraversalDecision> inspectDirectory,
+        IProgress<DirectoryDiscoveryProgress>? progress)
+    {
+        private long _directories;
+        private long _prunedDirectories;
+
+        public DirectoryDiscoveryProgress LastProgress { get; private set; } =
+            new(0, 0, 0, 0, 0, 0, TimeSpan.Zero);
+
+        public bool Inspect(DirectoryCandidate candidate)
+        {
+            _directories++;
+            return inspectDirectory(candidate) switch
+            {
+                DirectoryTraversalDecision.Continue => true,
+                DirectoryTraversalDecision.SkipDescendants => Prune(),
+                var decision => throw new InvalidOperationException(
+                    $"Unsupported directory traversal decision: {decision}.")
+            };
+        }
+
+        public void Report(ScanProgress scan)
+        {
+            LastProgress = new DirectoryDiscoveryProgress(scan.Entries, _directories,
+                scan.ExcludedEntries, scan.SkippedLinks, _prunedDirectories,
+                scan.ErrorCount, scan.Elapsed);
+            progress?.Report(LastProgress);
+        }
+
+        private bool Prune()
+        {
+            _prunedDirectories++;
+            return false;
+        }
     }
 
     private sealed class Settings(ScanOptions options, ExclusionMatcher exclusions,

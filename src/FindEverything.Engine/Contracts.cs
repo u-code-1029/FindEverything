@@ -7,6 +7,7 @@ public enum ScanStatus { Completed, Partial, Cancelled, Deferred }
 public enum DeferralReason { ExplicitRule, HistoricalEntryCount, HistoricalDuration, EntryBudget, TimeBudget, PendingLimit }
 public enum RegexMatchMode { Full, Partial }
 public enum ExclusionReason { Path, DirectoryName, DirectoryNameRegex, FilePattern }
+public enum DirectoryTraversalDecision { Continue, SkipDescendants }
 
 public sealed record DirectoryNameRegex
 {
@@ -91,6 +92,35 @@ public sealed record ScanReport(
     public ScanDiagnostics Diagnostics { get; init; } = new();
 }
 
+public sealed record DirectoryCandidate(
+    string FullPath,
+    string Name,
+    string? ParentPath,
+    int Depth,
+    DateTimeOffset CreatedUtc,
+    DateTimeOffset ModifiedUtc);
+
+// Entries counts every enumerated child (including files and excluded entries).
+// Directories counts candidates delivered to the caller, including the discovery scope.
+public sealed record DirectoryDiscoveryProgress(
+    long Entries,
+    long Directories,
+    long ExcludedEntries,
+    long SkippedLinks,
+    long PrunedDirectories,
+    long ErrorCount,
+    TimeSpan Elapsed);
+
+public sealed record DirectoryDiscoveryReport(
+    string RootPath,
+    string ScopePath,
+    ScanStatus Status,
+    DirectoryDiscoveryProgress Progress,
+    IReadOnlyList<ScanError> Errors)
+{
+    public ScanDiagnostics Diagnostics { get; init; } = new();
+}
+
 public sealed record ScanOptions
 {
     public IReadOnlyList<string> ExcludedDirectoryNames { get; init; } = [];
@@ -164,6 +194,12 @@ public sealed record ScanRequest(string RootPath)
     internal Func<IReadOnlyList<DirectoryScanCost>, CancellationToken, Task>? WriteCosts { get; init; }
 }
 
+public sealed record DirectoryDiscoveryRequest(string RootPath)
+{
+    public string? ScopePath { get; init; }
+    public ScanOptions Options { get; init; } = new();
+}
+
 public sealed record SearchQuery
 {
     // Whitespace-delimited literal terms. Every term must occur in either the
@@ -215,6 +251,16 @@ public interface IMetadataScanner
     Task<ScanReport> ScanAsync(ScanRequest request, Guid scanId,
         Func<IReadOnlyList<IndexedEntry>, CancellationToken, Task> writeBatch,
         IProgress<ScanProgress>? progress = null, CancellationToken cancellationToken = default);
+}
+
+// Directory discovery owns no database and reports a candidate before opening its descendants.
+public interface IDirectoryDiscoveryScanner
+{
+    Task<DirectoryDiscoveryReport> DiscoverDirectoriesAsync(
+        DirectoryDiscoveryRequest request,
+        Func<DirectoryCandidate, DirectoryTraversalDecision> inspectDirectory,
+        IProgress<DirectoryDiscoveryProgress>? progress = null,
+        CancellationToken cancellationToken = default);
 }
 
 public interface IIndexStore : IAsyncDisposable
