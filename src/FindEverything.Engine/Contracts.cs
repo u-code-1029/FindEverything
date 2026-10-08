@@ -7,7 +7,8 @@ public enum ScanStatus { Completed, Partial, Cancelled, Deferred }
 public enum DeferralReason { ExplicitRule, HistoricalEntryCount, HistoricalDuration, EntryBudget, TimeBudget, PendingLimit }
 public enum RegexMatchMode { Full, Partial }
 public enum ExclusionReason { Path, DirectoryName, DirectoryNameRegex, FilePattern }
-public enum DirectoryTraversalDecision { Continue, SkipDescendants }
+// Continue enters the directory; SkipDescendants keeps its row; ExcludeSubtree omits its row.
+public enum DirectoryTraversalDecision { Continue, SkipDescendants, ExcludeSubtree }
 
 public sealed record DirectoryNameRegex
 {
@@ -15,6 +16,7 @@ public sealed record DirectoryNameRegex
     public RegexMatchMode MatchMode { get; init; } = RegexMatchMode.Full;
     // Null follows the host's path case semantics, like exact directory names.
     public bool? IgnoreCase { get; init; }
+    public int TimeoutMilliseconds { get; init; } = 100;
 }
 
 public sealed record ExcludedEntry(string Path, EntryKind Kind, ExclusionReason Reason, string Rule);
@@ -98,7 +100,10 @@ public sealed record DirectoryCandidate(
     string? ParentPath,
     int Depth,
     DateTimeOffset CreatedUtc,
-    DateTimeOffset ModifiedUtc);
+    DateTimeOffset ModifiedUtc)
+{
+    public bool CoveragePending { get; init; }
+}
 
 // Entries counts every enumerated child (including files and excluded entries).
 // Directories counts candidates delivered to the caller, including the discovery scope.
@@ -189,6 +194,9 @@ public sealed record ScanRequest(string RootPath)
     public ScanOptions Options { get; init; } = new();
     // Bypass deferral only: exclusions, rate limits, link checks and cancellation remain active.
     public bool OnDemand { get; init; }
+    // Optional synchronous inspection before entering a directory. SkipDescendants keeps the
+    // directory in the index; ExcludeSubtree omits both the directory and its descendants.
+    public Func<DirectoryCandidate, DirectoryTraversalDecision>? InspectDirectory { get; init; }
     internal IReadOnlyDictionary<string, DirectoryScanCost> CostHints { get; init; } =
         new Dictionary<string, DirectoryScanCost>(PathRules.Comparer);
     internal Func<IReadOnlyList<DirectoryScanCost>, CancellationToken, Task>? WriteCosts { get; init; }

@@ -88,18 +88,28 @@ public sealed class ScanSafetyTests
     }
 
     [Fact]
-    public async Task IndexInsideSourceIsRejectedBeforeDatabaseDirectoryOrFilesAreCreated()
+    public async Task IndexInsideSourceIsCreatedButItsSqliteArtifactsAreNeverIndexed()
     {
         using var workspace = new TestWorkspace();
-        workspace.WriteFile("keep.txt");
+        var retained = workspace.WriteFile("keep.txt");
         var indexDirectory = Path.Combine(workspace.SourcePath, "new-index");
-        await using var store = new SqliteIndexStore(Path.Combine(indexDirectory, "metadata.db"));
+        var databasePath = Path.Combine(indexDirectory, "metadata.db");
+        await using var store = new SqliteIndexStore(databasePath);
         var engine = new IndexingEngine(new FileSystemMetadataScanner(), store);
 
-        await Assert.ThrowsAnyAsync<ArgumentException>(() => engine.ScanAsync(workspace.Request()));
+        var report = await engine.ScanAsync(workspace.Request());
+        var entries = (await store.SearchAsync(new SearchQuery
+        {
+            RootPath = workspace.SourcePath,
+        })).Entries;
 
-        Assert.False(Directory.Exists(indexDirectory));
-        Assert.Equal([Path.Combine(workspace.SourcePath, "keep.txt")], Directory.GetFiles(workspace.SourcePath, "*", SearchOption.AllDirectories));
+        Assert.Equal(ScanStatus.Completed, report.Status);
+        Assert.True(File.Exists(databasePath));
+        Assert.Contains(entries, entry => PathRules.Comparer.Equals(entry.FullPath, retained));
+        Assert.DoesNotContain(entries, entry =>
+            PathRules.Comparer.Equals(entry.FullPath, databasePath)
+            || entry.FullPath.StartsWith(databasePath + "-", PathRules.Comparison)
+            || PathRules.Comparer.Equals(entry.FullPath, databasePath + ".writer.lock"));
     }
 
     [LinuxFact]

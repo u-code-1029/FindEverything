@@ -15,13 +15,16 @@ public sealed class IndexingEngine(IMetadataScanner scanner, IIndexStore store)
         if (!PathRules.IsWithin(scope, root))
             throw new ArgumentException("The refresh scope must be within its registered root.", nameof(request));
         var database = PathRules.Normalize(store.DatabasePath);
-        if (PathRules.IsWithin(database, root))
-            throw new ArgumentException("The index database must be outside the source root. Prefer a separate local SSD.", nameof(request));
         // Validate paths before any index file, directory or writer lock is created.
         PathRules.EnsureNoReparseAncestors(root);
         PathRules.EnsureNoReparseAncestors(scope);
         PathRules.EnsureNoReparseAncestors(database);
-        request = request with { RootPath = root, ScopePath = scope };
+        request = request with
+        {
+            RootPath = root,
+            ScopePath = scope,
+            Options = ExcludeIndexArtifactsWhenNeeded(request.Options, database, root)
+        };
 
         await using var writer = await store.AcquireWriterAsync(cancellationToken).ConfigureAwait(false);
         await store.InitializeAsync(cancellationToken).ConfigureAwait(false);
@@ -75,5 +78,33 @@ public sealed class IndexingEngine(IMetadataScanner scanner, IIndexStore store)
     private sealed class DirectProgress(Action<ScanProgress> report) : IProgress<ScanProgress>
     {
         public void Report(ScanProgress value) => report(value);
+    }
+
+    private static ScanOptions ExcludeIndexArtifactsWhenNeeded(
+        ScanOptions options,
+        string databasePath,
+        string rootPath)
+    {
+        if (!PathRules.IsWithin(databasePath, rootPath))
+            return options;
+
+        // A LocalAppData index naturally lives below C:\ when the user scans the
+        // complete system drive. Excluding the SQLite files is safer and more useful
+        // than requiring a second physical drive. Keep the list exact so neighboring
+        // application data remains searchable.
+        var excludedPaths = options.ExcludedPaths
+            .Concat(
+            [
+                databasePath,
+                databasePath + "-wal",
+                databasePath + "-shm",
+                databasePath + "-journal",
+                databasePath + ".writer.lock",
+            ])
+            .Distinct(PathRules.Comparer)
+            .ToArray();
+        var updated = options with { ExcludedPaths = excludedPaths };
+        updated.Validate(rootPath);
+        return updated;
     }
 }

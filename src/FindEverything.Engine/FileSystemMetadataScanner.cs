@@ -23,11 +23,15 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
             throw new ArgumentException("The scan scope must be inside the configured root.", nameof(request));
 
         var settings = Settings.Create(request.Options, root, request.CostHints, request.OnDemand);
+        var inspectDirectory = request.InspectDirectory;
+        var discovery = inspectDirectory is null
+            ? null
+            : new DiscoveryState(inspectDirectory, progress: null);
         // Native enumeration is synchronous, including SMB requests. Keep it off a WPF UI thread.
         // Do not pass the token to Task.Run: even pre-cancelled requests return a Cancelled report.
         return Task.Run(() => ScanCoreAsync(root, scope, scanId, settings,
             writeBatch, request.WriteCosts, progress, cancellationToken,
-            discovery: null, emitEntries: true));
+            discovery: discovery, emitEntries: true));
     }
 
     public Task<DirectoryDiscoveryReport> DiscoverDirectoriesAsync(
@@ -111,6 +115,7 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
             if (errors.Count < settings.Options.MaxRecordedErrors)
                 errors.Add(new ScanError(path, message));
         }
+        Action<ScanError> recordExclusionError = error => RecordError(error.Path, error.Message);
 
         void Defer(PendingScope deferred)
         {
@@ -242,7 +247,9 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
             cancellationToken.ThrowIfCancellationRequested();
             // Check all configured ancestors before opening a scoped refresh. A scope under an
             // excluded folder must not bypass pruning just because its parent isn't enumerated.
-            if (settings.Exclusions.MatchScope(scope, root) is { } excludedScope)
+            var excludedScope = settings.Exclusions.MatchScope(scope, root);
+            settings.Exclusions.DrainErrors(recordExclusionError);
+            if (excludedScope is not null)
             {
                 excluded++;
                 diagnostics.Exclude(excludedScope);
@@ -291,18 +298,24 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
                     }
                 }
 
-                var enterScope = ancestorsSafe;
+                var scopeDecision = DirectoryTraversalDecision.Continue;
                 if (scopeCandidate is not null)
                 {
                     diagnostics.ObserveDirectory(scopeCandidate.FullPath, scopeCandidate.Name);
-                    enterScope = discovery!.Inspect(scopeCandidate);
+                    scopeDecision = discovery!.Inspect(scopeCandidate);
                     cancellationToken.ThrowIfCancellationRequested();
                 }
 
+                var enterScope = ancestorsSafe
+                    && scopeDecision == DirectoryTraversalDecision.Continue;
+                if (scopeDecision == DirectoryTraversalDecision.ExcludeSubtree)
+                    excluded++;
                 if (enterScope)
                     await OpenDirectoryAsync(scope, 0).ConfigureAwait(false);
 
-                if (emitEntries && frames.Count > 0
+                var scopeWasInspectedAndPruned = scopeCandidate is not null
+                    && scopeDecision == DirectoryTraversalDecision.SkipDescendants;
+                if (emitEntries && (frames.Count > 0 || scopeWasInspectedAndPruned)
                     && !PathRules.Comparer.Equals(scope, root) && !BudgetExhausted())
                 {
                     IndexedEntry? scopeEntry = null;
@@ -358,6 +371,7 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
                         frames.Pop().Dispose();
                         continue;
                     }
+                    settings.Exclusions.DrainErrors(recordExclusionError);
 
                     if (!hasNext)
                     {
@@ -392,10 +406,30 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
                     var deferred = indexed.Kind == EntryKind.Directory
                         ? settings.GetDeferral(indexed.FullPath, root, checkAncestors: false) : null;
                     if (deferred is not null)
-                    {
                         indexed = indexed with { CoveragePending = true };
-                        Defer(deferred);
+
+                    var traversalDecision = DirectoryTraversalDecision.Continue;
+                    if (indexed.Kind == EntryKind.Directory && discovery is not null)
+                    {
+                        traversalDecision = discovery.Inspect(new DirectoryCandidate(
+                            indexed.FullPath, indexed.Name, indexed.ParentPath,
+                            frame.Depth + 1, indexed.CreatedUtc, indexed.ModifiedUtc)
+                        {
+                            CoveragePending = indexed.CoveragePending,
+                        });
+                        cancellationToken.ThrowIfCancellationRequested();
                     }
+
+                    if (traversalDecision == DirectoryTraversalDecision.ExcludeSubtree)
+                    {
+                        excluded++;
+                        continue;
+                    }
+
+                    // Profile exclusions take precedence over index deferral: an intentionally
+                    // omitted subtree must not leave a pending scope behind.
+                    if (deferred is not null)
+                        Defer(deferred);
                     if (emitEntries)
                     {
                         batch.Add(indexed);
@@ -406,17 +440,9 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
                         }
                     }
 
-                    var enterDirectory = true;
-                    if (indexed.Kind == EntryKind.Directory && discovery is not null)
-                    {
-                        enterDirectory = discovery.Inspect(new DirectoryCandidate(
-                            indexed.FullPath, indexed.Name, indexed.ParentPath,
-                            frame.Depth + 1, indexed.CreatedUtc, indexed.ModifiedUtc));
-                        cancellationToken.ThrowIfCancellationRequested();
-                    }
-
                     if (indexed.Kind == EntryKind.Directory && deferred is null
-                        && enterDirectory && !stopRequested)
+                        && traversalDecision == DirectoryTraversalDecision.Continue
+                        && !stopRequested)
                     {
                         if (frame.Depth >= settings.Options.MaxDepth)
                         {
@@ -500,13 +526,16 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
         public DirectoryDiscoveryProgress LastProgress { get; private set; } =
             new(0, 0, 0, 0, 0, 0, TimeSpan.Zero);
 
-        public bool Inspect(DirectoryCandidate candidate)
+        public DirectoryTraversalDecision Inspect(DirectoryCandidate candidate)
         {
             _directories++;
             return inspectDirectory(candidate) switch
             {
-                DirectoryTraversalDecision.Continue => true,
-                DirectoryTraversalDecision.SkipDescendants => Prune(),
+                DirectoryTraversalDecision.Continue => DirectoryTraversalDecision.Continue,
+                DirectoryTraversalDecision.SkipDescendants =>
+                    Prune(DirectoryTraversalDecision.SkipDescendants),
+                DirectoryTraversalDecision.ExcludeSubtree =>
+                    Prune(DirectoryTraversalDecision.ExcludeSubtree),
                 var decision => throw new InvalidOperationException(
                     $"Unsupported directory traversal decision: {decision}.")
             };
@@ -520,10 +549,10 @@ public sealed class FileSystemMetadataScanner : IMetadataScanner, IDirectoryDisc
             progress?.Report(LastProgress);
         }
 
-        private bool Prune()
+        private DirectoryTraversalDecision Prune(DirectoryTraversalDecision decision)
         {
             _prunedDirectories++;
-            return false;
+            return decision;
         }
     }
 

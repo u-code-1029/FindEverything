@@ -1,4 +1,3 @@
-using System.Text.RegularExpressions;
 using FindEverything.Engine;
 using Xunit;
 
@@ -96,6 +95,8 @@ public sealed class ExclusionDiagnosticsTests
         TestWorkspace.FastOptions with { ExcludedDirectoryNameRegexes = [new() { Pattern = "[" }] },
         TestWorkspace.FastOptions with { ExcludedDirectoryNameRegexes = [new() { Pattern = " " }] },
         TestWorkspace.FastOptions with { ExcludedDirectoryNameRegexes = [new() { Pattern = "cache", MatchMode = (RegexMatchMode)99 }] },
+        TestWorkspace.FastOptions with { ExcludedDirectoryNameRegexes = [new() { Pattern = "cache", TimeoutMilliseconds = 0 }] },
+        TestWorkspace.FastOptions with { ExcludedDirectoryNameRegexes = [new() { Pattern = "cache", TimeoutMilliseconds = 10_001 }] },
         TestWorkspace.FastOptions with { ExcludedDirectoryNameRegexes = [null!] },
         TestWorkspace.FastOptions with { ExcludedDirectoryNameRegexes = null! },
         TestWorkspace.FastOptions with { MaxRecordedExclusions = -1 },
@@ -115,33 +116,49 @@ public sealed class ExclusionDiagnosticsTests
     }
 
     [Fact]
-    public async Task RegexTimeoutDiscardsStagedRowsAndPreservesIndexAndPending()
+    public async Task RegexTimeoutIsReportedAndFailsOpenWhilePreservingUnverifiedRowsAndPending()
     {
         using var workspace = new TestWorkspace();
-        var old = workspace.WriteFile("work/old.txt");
+        var old = CanonicalTempPath(workspace.WriteFile("work/old.txt"));
         workspace.WriteFile("archive/hidden.txt");
-        await using var store = new SqliteIndexStore(workspace.DatabasePath);
+        var sourcePath = CanonicalTempPath(workspace.SourcePath);
+        await using var store = new SqliteIndexStore(CanonicalTempPath(workspace.DatabasePath));
         var engine = new IndexingEngine(new FileSystemMetadataScanner(), store);
-        await engine.ScanAsync(workspace.Request() with { Options = TestWorkspace.FastOptions with
+        await engine.ScanAsync(new ScanRequest(sourcePath) { Options = TestWorkspace.FastOptions with
         {
             Deferral = new() { DirectoryNames = ["archive"] }
         }});
-        var before = (await store.SearchAsync(new SearchQuery())).Entries.ToArray();
         var pending = (await store.ListPendingAsync(new PendingQuery())).Entries.ToArray();
         File.Delete(old);
-        Directory.CreateDirectory(Path.Combine(workspace.SourcePath, "work", new string('a', 200) + "!"));
+        var pathological = Path.Combine(sourcePath, "work", new string('a', 200) + "!");
+        Directory.CreateDirectory(pathological);
         var options = TestWorkspace.FastOptions with
         {
             BatchSize = 1,
-            ExcludedDirectoryNameRegexes = [new() { Pattern = "(a+)+$" }]
+            ExcludedDirectoryNameRegexes = [new() { Pattern = "(a+)+$", TimeoutMilliseconds = 1 }]
         };
 
-        await Assert.ThrowsAsync<RegexMatchTimeoutException>(() => engine.ScanAsync(
-            workspace.Request(Path.Combine(workspace.SourcePath, "work")) with { Options = options, OnDemand = true }));
+        var report = await engine.ScanAsync(
+            new ScanRequest(sourcePath)
+            {
+                ScopePath = Path.Combine(sourcePath, "work"),
+                Options = options,
+                OnDemand = true,
+            });
 
-        Assert.Equal(before, (await store.SearchAsync(new SearchQuery())).Entries.ToArray());
+        Assert.Equal(ScanStatus.Partial, report.Status);
+        var error = Assert.Single(report.Errors);
+        Assert.Equal(pathological, error.Path);
+        Assert.Contains("1 ms timeout", error.Message, StringComparison.Ordinal);
+        var afterTimeout = (await store.SearchAsync(new SearchQuery { Limit = 100 })).Entries;
+        Assert.Contains(afterTimeout, entry => PathRules.Comparer.Equals(entry.FullPath, old));
+        Assert.Contains(afterTimeout, entry => PathRules.Comparer.Equals(entry.FullPath, pathological));
         Assert.Equal(pending, (await store.ListPendingAsync(new PendingQuery())).Entries.ToArray());
-        Assert.Equal(ScanStatus.Completed, (await engine.ScanAsync(workspace.Request() with { OnDemand = true })).Status);
+        Assert.Equal(ScanStatus.Completed, (await engine.ScanAsync(new ScanRequest(sourcePath)
+        {
+            Options = TestWorkspace.FastOptions,
+            OnDemand = true,
+        })).Status);
     }
 
     [Fact]
@@ -250,4 +267,9 @@ public sealed class ExclusionDiagnosticsTests
         Assert.Empty((await store.SearchAsync(new SearchQuery { NameContains = "hidden.txt" })).Entries);
         Assert.Single((await store.SearchAsync(new SearchQuery { NameContains = "ordinary.txt" })).Entries);
     }
+
+    private static string CanonicalTempPath(string path) =>
+        OperatingSystem.IsMacOS() && path.StartsWith("/var/", StringComparison.Ordinal)
+            ? "/private" + path
+            : path;
 }
