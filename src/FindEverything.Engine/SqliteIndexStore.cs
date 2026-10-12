@@ -441,13 +441,13 @@ public sealed class SqliteIndexStore : IIndexStore
             command.CommandText = """
                 UPDATE roots SET last_scan_id=$scan, last_scope_path=$scopePath,
                     last_status=$status, last_published_ticks=$published,
-                    last_entries=$count, last_errors=$errors WHERE root_key=$root;
+                    last_entries=(SELECT COUNT(*) FROM entries WHERE root_key=$root),
+                    last_errors=$errors WHERE root_key=$root;
                 DELETE FROM scans WHERE scan_id=$scan;
                 """;
             command.Parameters.AddWithValue("$scopePath", PathRules.Normalize(report.ScopePath));
             command.Parameters.AddWithValue("$status", (int)report.Status);
             command.Parameters.AddWithValue("$published", DateTimeOffset.UtcNow.UtcTicks);
-            command.Parameters.AddWithValue("$count", report.Progress.Entries);
             command.Parameters.AddWithValue("$errors", report.Progress.ErrorCount);
             await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);

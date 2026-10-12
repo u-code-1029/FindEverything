@@ -48,6 +48,11 @@ public sealed class RefreshIntegrationTests
         Assert.Empty((await store.SearchAsync(new SearchQuery { NameContains = "old.txt" })).Entries);
         Assert.Equal(fresh, Assert.Single((await store.SearchAsync(new SearchQuery { NameContains = "fresh.txt" })).Entries).FullPath);
         Assert.Equal(sibling, Assert.Single((await store.SearchAsync(new SearchQuery { NameContains = "keep-until-refreshed" })).Entries).FullPath);
+        var indexed = await store.SearchAsync(new SearchQuery { RootPath = workspace.SourcePath });
+        var rootStatus = Assert.IsType<IndexRootStatus>(
+            await store.GetRootStatusAsync(workspace.SourcePath));
+        Assert.Equal(indexed.TotalCount, rootStatus.EntryCount);
+        Assert.NotEqual(report.Progress.Entries, rootStatus.EntryCount);
     }
 
     [Fact]
