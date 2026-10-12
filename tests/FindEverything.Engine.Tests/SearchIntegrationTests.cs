@@ -386,7 +386,13 @@ public sealed class SearchIntegrationTests
         await store.BeginScanAsync(scanId, workspace.SourcePath, workspace.SourcePath);
         await store.StageAsync(scanId,
             [Entry(workspace.SourcePath, "replacement.txt", EntryKind.File, 2, time, time)]);
-        await using (var connection = new SqliteConnection($"Data Source={workspace.DatabasePath}"))
+        // The fixture owns this extra pool independently from SqliteIndexStore.
+        // Close its native handle immediately so Windows can remove the workspace.
+        await using (var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = workspace.DatabasePath,
+            Pooling = false
+        }.ToString()))
         {
             await connection.OpenAsync();
             await using var command = connection.CreateCommand();
