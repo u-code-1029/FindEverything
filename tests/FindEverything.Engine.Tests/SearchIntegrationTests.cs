@@ -195,6 +195,23 @@ public sealed class SearchIntegrationTests
             }
             Assert.Equal(full.Entries.Select(entry => entry.FullPath), paged);
             Assert.Equal(entries.Length, paged.Distinct().Count());
+            var sequential = new List<string>();
+            string? cursor = null;
+            do
+            {
+                var page = await store.SearchAsync(query with
+                {
+                    Limit = 2,
+                    IncludeTotalCount = false,
+                    AfterCursor = cursor
+                });
+                Assert.False(page.TotalCountIncluded);
+                Assert.Equal(-1, page.TotalCount);
+                sequential.AddRange(page.Entries.Select(entry => entry.FullPath));
+                cursor = page.NextCursor;
+                Assert.Equal(page.HasMore, cursor is not null);
+            } while (cursor is not null);
+            Assert.Equal(full.Entries.Select(entry => entry.FullPath), sequential);
             if (field == EntrySortField.Size)
                 Assert.Null(full.Entries[^1].SizeBytes);
         }
@@ -231,7 +248,161 @@ public sealed class SearchIntegrationTests
         await using var reader = await command.ExecuteReaderAsync();
         Assert.True(await reader.ReadAsync());
         Assert.Equal(legacyPath.ToLowerInvariant(), reader.GetString(0));
-        Assert.Equal(3, reader.GetInt32(1));
+        Assert.Equal(4, reader.GetInt32(1));
+    }
+
+    [Fact]
+    public async Task FileTypeSortUsesCaseInsensitiveExtensionsAndLeavesKindSortCompatible()
+    {
+        using var workspace = new TestWorkspace();
+        var time = DateTimeOffset.UtcNow;
+        var entries = new[]
+        {
+            Entry(workspace.SourcePath, "z-folder.txt", EntryKind.Directory, null, time, time),
+            Entry(workspace.SourcePath, "z.PDF", EntryKind.File, 1, time, time),
+            Entry(workspace.SourcePath, "b.pdf", EntryKind.File, 1, time, time),
+            Entry(workspace.SourcePath, "a.ZIP", EntryKind.File, 1, time, time),
+            Entry(workspace.SourcePath, "no-extension", EntryKind.File, 1, time, time),
+            Entry(workspace.SourcePath, "c.txt", EntryKind.File, 1, time, time)
+        };
+        await using var store = new SqliteIndexStore(workspace.DatabasePath);
+        await PublishAsync(store, workspace.SourcePath, entries);
+
+        var byType = await store.SearchAsync(new SearchQuery { SortBy = EntrySortField.FileType });
+        Assert.Equal(new[] { "z-folder.txt", "no-extension", "b.pdf", "z.PDF", "c.txt", "a.ZIP" },
+            byType.Entries.Select(entry => entry.Name));
+        var descending = await store.SearchAsync(new SearchQuery
+            { SortBy = EntrySortField.FileType, SortDirection = SortDirection.Descending });
+        Assert.Equal(new[] { "z-folder.txt", "a.ZIP", "c.txt", "b.pdf", "z.PDF", "no-extension" },
+            descending.Entries.Select(entry => entry.Name));
+        var byKind = await store.SearchAsync(new SearchQuery { SortBy = EntrySortField.Kind });
+        Assert.Equal(EntryKind.Directory, byKind.Entries[^1].Kind);
+        Assert.All(byKind.Entries.Take(byKind.Entries.Count - 1), entry => Assert.Equal(EntryKind.File, entry.Kind));
+    }
+
+    [Fact]
+    public async Task SequentialCursorRejectsChangedQueryAndPublishedGeneration()
+    {
+        using var workspace = new TestWorkspace();
+        var time = DateTimeOffset.UtcNow;
+        var entries = new[]
+        {
+            Entry(workspace.SourcePath, "a.txt", EntryKind.File, 1, time, time),
+            Entry(workspace.SourcePath, "b.txt", EntryKind.File, 1, time, time),
+            Entry(workspace.SourcePath, "c.txt", EntryKind.File, 1, time, time)
+        };
+        await using var store = new SqliteIndexStore(workspace.DatabasePath);
+        var published = await PublishAsync(store, workspace.SourcePath, entries);
+        var query = new SearchQuery { RootPath = workspace.SourcePath, Limit = 1, IncludeTotalCount = false };
+        var first = await store.SearchAsync(query);
+        Assert.Equal(published.ScanId, first.LastScanId);
+        Assert.NotNull(first.NextCursor);
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SearchAsync(query with
+            { AfterCursor = first.NextCursor, SearchText = "a" }));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SearchAsync(query with
+            { AfterCursor = first.NextCursor, Offset = 1 }));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SearchAsync(query with
+            { AfterCursor = "invalid cursor" }));
+        var replacement = await PublishAsync(store, workspace.SourcePath, entries);
+        var changed = await Assert.ThrowsAsync<PublishedIndexChangedException>(() =>
+            store.SearchAsync(query with { AfterCursor = first.NextCursor }));
+        Assert.Equal(published.ScanId, changed.ExpectedScanId);
+        Assert.Equal(replacement.ScanId, changed.ActualScanId);
+        await Assert.ThrowsAsync<PublishedIndexChangedException>(() =>
+            store.SearchAsync(query with { ExpectedScanId = published.ScanId }));
+        var refreshed = await store.SearchAsync(query with { ExpectedScanId = replacement.ScanId });
+        Assert.Equal(replacement.ScanId, refreshed.LastScanId);
+    }
+
+    [Fact]
+    public async Task ExactPathRestrictionUsesIndexedLiteralPathsAndKeepsCurrentSorting()
+    {
+        using var workspace = new TestWorkspace();
+        var time = DateTimeOffset.UtcNow;
+        var entries = Enumerable.Range(0, 2000).Select(index =>
+            Entry(workspace.SourcePath, $"row-{index:D4}.txt", EntryKind.File, index, time, time)).ToArray();
+        await using var store = new SqliteIndexStore(workspace.DatabasePath);
+        var report = await PublishAsync(store, workspace.SourcePath, entries);
+        var query = new SearchQuery
+        {
+            RootPath = workspace.SourcePath,
+            ExpectedScanId = report.ScanId,
+            FullPaths = [entries[3].FullPath, entries[1900].FullPath, entries[57].FullPath],
+            SortBy = EntrySortField.Size,
+            SortDirection = SortDirection.Descending,
+            Limit = 2,
+        };
+        var first = await store.SearchAsync(query);
+        Assert.Equal(new long?[] { 1900, 57 }, first.Entries.Select(entry => entry.SizeBytes));
+        Assert.Equal(3, first.TotalCount);
+        var last = await store.SearchAsync(query with { AfterCursor = first.NextCursor, IncludeTotalCount = false });
+        Assert.Equal(entries[3].FullPath, Assert.Single(last.Entries).FullPath);
+        Assert.False(last.HasMore);
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SearchAsync(query with
+            { FullPaths = [entries[3].FullPath], AfterCursor = first.NextCursor }));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SearchAsync(query with { FullPaths = ["relative.txt"] }));
+        await Assert.ThrowsAsync<ArgumentException>(() => store.SearchAsync(query with { FullPaths = entries.Take(1001).Select(entry => entry.FullPath).ToArray() }));
+    }
+
+    [Fact]
+    public async Task PublishedSearchRemainsAvailableDuringStagingAndDiscard()
+    {
+        using var workspace = new TestWorkspace();
+        var time = DateTimeOffset.UtcNow;
+        var oldEntry = Entry(workspace.SourcePath, "old.txt", EntryKind.File, 1, time, time);
+        await using var store = new SqliteIndexStore(workspace.DatabasePath);
+        var published = await PublishAsync(store, workspace.SourcePath, [oldEntry]);
+        await using var readerStore = new SqliteIndexStore(workspace.DatabasePath);
+        var stagedScan = Guid.NewGuid();
+        await using (var writer = await store.AcquireWriterAsync())
+        {
+            await store.InitializeAsync();
+            await store.BeginScanAsync(stagedScan, workspace.SourcePath, workspace.SourcePath);
+            await store.StageAsync(stagedScan,
+                [Entry(workspace.SourcePath, "new.txt", EntryKind.File, 2, time, time)]);
+            var during = await readerStore.SearchAsync(new SearchQuery
+                { RootPath = workspace.SourcePath, ExpectedScanId = published.ScanId });
+            Assert.Equal(oldEntry.FullPath, Assert.Single(during.Entries).FullPath);
+            Assert.Equal(1, (await readerStore.GetRootStatusAsync(workspace.SourcePath))!.EntryCount);
+            await store.DiscardAsync(stagedScan);
+        }
+        var after = await readerStore.SearchAsync(new SearchQuery
+            { RootPath = workspace.SourcePath, ExpectedScanId = published.ScanId });
+        Assert.Equal(oldEntry.FullPath, Assert.Single(after.Entries).FullPath);
+        Assert.Equal(published.ScanId, after.LastScanId);
+    }
+
+    [Fact]
+    public async Task FailedPublishRollsBackBothRowsAndGeneration()
+    {
+        using var workspace = new TestWorkspace();
+        var time = DateTimeOffset.UtcNow;
+        var oldEntry = Entry(workspace.SourcePath, "old.txt", EntryKind.File, 1, time, time);
+        await using var store = new SqliteIndexStore(workspace.DatabasePath);
+        var published = await PublishAsync(store, workspace.SourcePath, [oldEntry]);
+        await using var writer = await store.AcquireWriterAsync();
+        await store.InitializeAsync();
+        var scanId = Guid.NewGuid();
+        await store.BeginScanAsync(scanId, workspace.SourcePath, workspace.SourcePath);
+        await store.StageAsync(scanId,
+            [Entry(workspace.SourcePath, "replacement.txt", EntryKind.File, 2, time, time)]);
+        await using (var connection = new SqliteConnection($"Data Source={workspace.DatabasePath}"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "CREATE TRIGGER reject_publish BEFORE INSERT ON entries BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;";
+            await command.ExecuteNonQueryAsync();
+        }
+
+        var report = new ScanReport(scanId, workspace.SourcePath, workspace.SourcePath,
+            ScanStatus.Completed, new ScanProgress(1, 0, 0, 0, 0, TimeSpan.Zero), []);
+        await Assert.ThrowsAsync<SqliteException>(() => store.PublishAsync(report));
+        var stillPublished = await store.SearchAsync(new SearchQuery
+            { RootPath = workspace.SourcePath, ExpectedScanId = published.ScanId });
+        Assert.Equal(oldEntry.FullPath, Assert.Single(stillPublished.Entries).FullPath);
+        Assert.Equal(published.ScanId, stillPublished.LastScanId);
+        Assert.Equal(1, (await store.GetRootStatusAsync(workspace.SourcePath))!.EntryCount);
+        await store.DiscardAsync(scanId);
     }
 
     [Fact]
@@ -323,6 +494,10 @@ public sealed class SearchIntegrationTests
                 entry => entry.FullPath.ToLowerInvariant(), StringComparer.Ordinal),
             EntrySortField.Kind when ascending => entries.OrderBy(entry => entry.Kind),
             EntrySortField.Kind => entries.OrderByDescending(entry => entry.Kind),
+            EntrySortField.FileType when ascending => entries.OrderByDescending(entry => entry.Kind)
+                .ThenBy(entry => entry.Kind == EntryKind.Directory ? string.Empty : Path.GetExtension(entry.Name).TrimStart('.').ToLowerInvariant(), StringComparer.Ordinal),
+            EntrySortField.FileType => entries.OrderByDescending(entry => entry.Kind)
+                .ThenByDescending(entry => entry.Kind == EntryKind.Directory ? string.Empty : Path.GetExtension(entry.Name).TrimStart('.').ToLowerInvariant(), StringComparer.Ordinal),
             EntrySortField.Size when ascending => entries.OrderBy(entry => entry.SizeBytes is null)
                 .ThenBy(entry => entry.SizeBytes.GetValueOrDefault()),
             EntrySortField.Size => entries.OrderBy(entry => entry.SizeBytes is null)

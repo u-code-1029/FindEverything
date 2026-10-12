@@ -1,4 +1,6 @@
 using System.Text;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.Data.Sqlite;
 
 namespace FindEverything.Engine;
@@ -10,7 +12,7 @@ namespace FindEverything.Engine;
 public sealed class SqliteIndexStore : IIndexStore
 {
     private const int ApplicationId = 0x46455631; // FEV1: never initialize an unrelated SQLite file.
-    private const int SchemaVersion = 3;
+    private const int SchemaVersion = 4;
     private const int MaximumWriteBatch = 512;
     private readonly SemaphoreSlim _writerSemaphore = new(1, 1);
     private readonly SemaphoreSlim _writeGate = new(1, 1);
@@ -108,6 +110,8 @@ public sealed class SqliteIndexStore : IIndexStore
                     await PopulatePathSearchAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
                     await ExecuteAsync(connection, MigrationV3SearchSql, cancellationToken, transaction).ConfigureAwait(false);
                 }
+                if (existingVersion is >= 1 and < 4)
+                    await ExecuteAsync(connection, MigrationV4Sql, cancellationToken, transaction).ConfigureAwait(false);
                 await ExecuteAsync(connection, SchemaSql, cancellationToken, transaction).ConfigureAwait(false);
                 // Holding the sole writer lease makes abandoned staging rows safe to remove.
                 await ExecuteAsync(connection, "DELETE FROM scans;", cancellationToken, transaction).ConfigureAwait(false);
@@ -179,13 +183,13 @@ public sealed class SqliteIndexStore : IIndexStore
                 await using var command = connection.CreateCommand();
                 command.Transaction = transaction;
                 command.CommandText = """
-                    INSERT INTO staging(scan_id, path_key, full_path, path_search, name, name_search,
+                    INSERT INTO staging(scan_id, path_key, full_path, path_search, name, name_search, file_type,
                         parent_path, kind, size_bytes, created_ticks, modified_ticks)
-                    VALUES($scan, $pathKey, $path, $pathSearch, $name, $nameSearch,
+                    VALUES($scan, $pathKey, $path, $pathSearch, $name, $nameSearch, $fileType,
                         $parent, $kind, $size, $created, $modified)
                     ON CONFLICT(scan_id, path_key) DO UPDATE SET
                         full_path=excluded.full_path, path_search=excluded.path_search, name=excluded.name,
-                        name_search=excluded.name_search, parent_path=excluded.parent_path,
+                        name_search=excluded.name_search, file_type=excluded.file_type, parent_path=excluded.parent_path,
                         kind=excluded.kind, size_bytes=excluded.size_bytes,
                         created_ticks=excluded.created_ticks, modified_ticks=excluded.modified_ticks;
                     """;
@@ -195,6 +199,7 @@ public sealed class SqliteIndexStore : IIndexStore
                 var pathSearchParameter = command.Parameters.Add("$pathSearch", SqliteType.Text);
                 var nameParameter = command.Parameters.Add("$name", SqliteType.Text);
                 var searchParameter = command.Parameters.Add("$nameSearch", SqliteType.Text);
+                var fileTypeParameter = command.Parameters.Add("$fileType", SqliteType.Text);
                 var parentParameter = command.Parameters.Add("$parent", SqliteType.Text);
                 var kindParameter = command.Parameters.Add("$kind", SqliteType.Integer);
                 var sizeParameter = command.Parameters.Add("$size", SqliteType.Integer);
@@ -222,6 +227,7 @@ public sealed class SqliteIndexStore : IIndexStore
                     pathSearchParameter.Value = path.ToLowerInvariant();
                     nameParameter.Value = entry.Name;
                     searchParameter.Value = entry.Name.ToLowerInvariant();
+                    fileTypeParameter.Value = FileTypeKey(entry.Name, entry.Kind);
                     parentParameter.Value = PathRules.Normalize(entry.ParentPath);
                     kindParameter.Value = (int)entry.Kind;
                     sizeParameter.Value = (object?)entry.SizeBytes ?? DBNull.Value;
@@ -376,18 +382,19 @@ public sealed class SqliteIndexStore : IIndexStore
             await using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = """
-                INSERT INTO entries(root_key, path_key, full_path, path_search, name, name_search,
+                INSERT INTO entries(root_key, path_key, full_path, path_search, name, name_search, file_type,
                     parent_path, kind, size_bytes, created_ticks, modified_ticks)
-                SELECT $root, path_key, full_path, path_search, name, name_search,
+                SELECT $root, path_key, full_path, path_search, name, name_search, file_type,
                     parent_path, kind, size_bytes, created_ticks, modified_ticks
                 FROM staging WHERE scan_id=$scan
                 ON CONFLICT(root_key, path_key) DO UPDATE SET
                     full_path=excluded.full_path, path_search=excluded.path_search,
-                    name=excluded.name, name_search=excluded.name_search,
+                    name=excluded.name, name_search=excluded.name_search, file_type=excluded.file_type,
                     parent_path=excluded.parent_path, kind=excluded.kind, size_bytes=excluded.size_bytes,
                     created_ticks=excluded.created_ticks, modified_ticks=excluded.modified_ticks
                 WHERE entries.full_path IS NOT excluded.full_path
                     OR entries.path_search IS NOT excluded.path_search OR entries.name IS NOT excluded.name
+                    OR entries.file_type IS NOT excluded.file_type
                     OR entries.parent_path IS NOT excluded.parent_path OR entries.kind IS NOT excluded.kind
                     OR entries.size_bytes IS NOT excluded.size_bytes
                     OR entries.created_ticks IS NOT excluded.created_ticks
@@ -479,9 +486,16 @@ public sealed class SqliteIndexStore : IIndexStore
     public async Task<SearchResult> SearchAsync(SearchQuery query, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(query);
+        ArgumentNullException.ThrowIfNull(query.FullPaths);
+        if (query.FullPaths.Count > 1000 || query.FullPaths.Any(path => string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path)))
+            throw new ArgumentException("Exact path searches require at most 1000 absolute paths.", nameof(query));
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (query.Limit is < 1 or > 1000 || query.Offset < 0)
             throw new ArgumentOutOfRangeException(nameof(query), "Limit must be 1–1000 and offset must be nonnegative.");
+        if (query.AfterCursor is not null && query.Offset != 0)
+            throw new ArgumentException("Offset must be zero when using a sequential cursor.", nameof(query));
+        if (query.ExpectedScanId is not null && query.RootPath is null)
+            throw new ArgumentException("A generation check requires a root path.", nameof(query));
         if (query.Kind is { } kind && !Enum.IsDefined(kind))
             throw new ArgumentException("Unknown entry kind.", nameof(query));
         if (!Enum.IsDefined(query.SortBy) || !Enum.IsDefined(query.SortDirection))
@@ -501,6 +515,29 @@ public sealed class SqliteIndexStore : IIndexStore
         await using var connection = await OpenAsync(true, cancellationToken).ConfigureAwait(false);
         await using var transaction = connection.BeginTransaction(deferred: true);
         var version = await ValidateSchemaAsync(connection, cancellationToken, transaction).ConfigureAwait(false);
+        var fingerprint = QueryFingerprint(query, rootKey, terms, normalizedName);
+        var cursor = query.AfterCursor is null ? null : DecodeCursor(query.AfterCursor, fingerprint);
+        Guid? lastScanId = null;
+        if (rootKey is not null)
+        {
+            await using var generationCommand = connection.CreateCommand();
+            generationCommand.Transaction = transaction;
+            generationCommand.CommandText = "SELECT last_scan_id FROM roots WHERE root_key=$root AND last_published_ticks IS NOT NULL;";
+            generationCommand.Parameters.AddWithValue("$root", rootKey);
+            var storedId = await generationCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+            if (storedId is string text)
+            {
+                if (!Guid.TryParseExact(text, "N", out var parsed))
+                    throw new InvalidDataException("The index contains an invalid last scan identifier.");
+                lastScanId = parsed;
+            }
+            // This check and row retrieval share the same short read transaction.
+            // A concurrent writer can publish, but cannot change the page snapshot.
+            if (query.ExpectedScanId is { } expected && expected != lastScanId)
+                throw new PublishedIndexChangedException(PathRules.Normalize(query.RootPath!), expected, lastScanId);
+            if (cursor is not null && cursor.ScanId != lastScanId)
+                throw new PublishedIndexChangedException(PathRules.Normalize(query.RootPath!), cursor.ScanId, lastScanId);
+        }
         var hasPending = false;
         if (version >= 2)
         {
@@ -514,31 +551,40 @@ public sealed class SqliteIndexStore : IIndexStore
             hasPending = await pendingCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
         }
 
-        await using var countCommand = connection.CreateCommand();
-        countCommand.Transaction = transaction;
-        var countPredicates = AddSearchPredicates(countCommand, query, version, rootKey, terms, normalizedName);
-        var countWhere = countPredicates.Count == 0 ? "" : "WHERE " + string.Join(" AND ", countPredicates);
-        countCommand.CommandText = $"SELECT COUNT(*) FROM entries e {countWhere};";
-        var totalCount = Convert.ToInt64(await countCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+        var totalCount = -1L;
+        if (query.IncludeTotalCount)
+        {
+            await using var countCommand = connection.CreateCommand();
+            countCommand.Transaction = transaction;
+            var countPredicates = AddSearchPredicates(countCommand, query, version, rootKey, terms, normalizedName);
+            var countWhere = countPredicates.Count == 0 ? "" : "WHERE " + string.Join(" AND ", countPredicates);
+            countCommand.CommandText = $"SELECT COUNT(*) FROM entries e {countWhere};";
+            totalCount = Convert.ToInt64(await countCommand.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+        }
 
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         var predicates = AddSearchPredicates(command, query, version, rootKey, terms, normalizedName);
+        var sortTerms = BuildSortTerms(query.SortBy, query.SortDirection, version);
+        if (cursor is not null)
+            predicates.Add(AddCursorPredicate(command, sortTerms, cursor));
         var where = predicates.Count == 0 ? "" : "WHERE " + string.Join(" AND ", predicates);
         var coverage = version < 2 ? "0" : """
             EXISTS(SELECT 1 FROM pending_scopes p WHERE p.root_key=e.root_key
                 AND (e.path_key=p.path_key OR (e.path_key >= p.lower_bound AND e.path_key < p.upper_bound)))
             """;
-        var orderBy = BuildOrderBy(query.SortBy, query.SortDirection, version);
+        var orderBy = string.Join(", ", sortTerms.Select(term => $"{term.Expression} {(term.Descending ? "DESC" : "ASC")}"));
+        var cursorColumns = string.Join(", ", sortTerms.Select(term => term.Expression));
         command.CommandText = $"""
             SELECT e.full_path, e.name, e.parent_path, e.kind, e.size_bytes,
-                e.created_ticks, e.modified_ticks, {coverage} FROM entries e {where}
+                e.created_ticks, e.modified_ticks, {coverage}, {cursorColumns} FROM entries e {where}
             ORDER BY {orderBy}
             LIMIT $limit OFFSET $offset;
             """;
-        command.Parameters.AddWithValue("$limit", query.Limit);
+        command.Parameters.AddWithValue("$limit", query.Limit + 1);
         command.Parameters.AddWithValue("$offset", query.Offset);
-        var entries = new List<IndexedEntry>(query.Limit);
+        var entries = new List<IndexedEntry>(query.Limit + 1);
+        CursorValue[]? lastValues = null;
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -546,13 +592,24 @@ public sealed class SqliteIndexStore : IIndexStore
                 (EntryKind)reader.GetInt32(3), reader.IsDBNull(4) ? null : reader.GetInt64(4),
                 new DateTimeOffset(reader.GetInt64(5), TimeSpan.Zero),
                 new DateTimeOffset(reader.GetInt64(6), TimeSpan.Zero)) { CoveragePending = reader.GetBoolean(7) });
+            if (entries.Count <= query.Limit)
+                lastValues = sortTerms.Select((term, index) => term.IsText
+                    ? new CursorValue(reader.GetString(8 + index), null)
+                    : new CursorValue(null, reader.GetInt64(8 + index))).ToArray();
         }
 
-        var hasMore = query.Offset + (long)entries.Count < totalCount;
+        var hasMore = entries.Count > query.Limit;
+        if (hasMore)
+            entries.RemoveAt(entries.Count - 1);
         return new SearchResult(entries.AsReadOnly(), hasMore)
         {
             TotalCount = totalCount,
-            HasPendingScopes = hasPending
+            TotalCountIncluded = query.IncludeTotalCount,
+            LastScanId = lastScanId,
+            HasPendingScopes = hasPending,
+            NextCursor = hasMore && lastValues is not null
+                ? EncodeCursor(new SearchCursorData(fingerprint, lastScanId, lastValues))
+                : null
         };
     }
 
@@ -572,7 +629,7 @@ public sealed class SqliteIndexStore : IIndexStore
         command.CommandText = $"""
             SELECT r.root_path, r.last_scan_id, r.last_scope_path, r.last_status,
                 r.last_published_ticks,
-                (SELECT COUNT(*) FROM entries e WHERE e.root_key=r.root_key),
+                COALESCE(r.last_entries, 0),
                 COALESCE(r.last_errors, 0), {pending}
             FROM roots r
             WHERE r.root_key=$root AND r.last_published_ticks IS NOT NULL;
@@ -763,6 +820,10 @@ public sealed class SqliteIndexStore : IIndexStore
             connection.CreateFunction<string, string>(
                 "invariant_lower",
                 static value => value.ToLowerInvariant());
+            connection.CreateFunction<string, long, string>(
+                "file_type_key",
+                static (name, kind) => FileTypeKey(name, (EntryKind)kind),
+                isDeterministic: true);
             await ExecuteAsync(connection, readOnly
                 ? "PRAGMA query_only=ON; PRAGMA foreign_keys=ON;"
                 : "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
@@ -1020,6 +1081,17 @@ public sealed class SqliteIndexStore : IIndexStore
             predicates.Add("e.root_key=$root");
             command.Parameters.AddWithValue("$root", rootKey);
         }
+        if (query.FullPaths.Count > 0)
+        {
+            var parameters = new List<string>(query.FullPaths.Count);
+            for (var index = 0; index < query.FullPaths.Count; index++)
+            {
+                var parameter = "$exactPath" + index;
+                parameters.Add(parameter);
+                command.Parameters.AddWithValue(parameter, PathRules.Key(query.FullPaths[index]));
+            }
+            predicates.Add($"e.path_key IN ({string.Join(',', parameters)})");
+        }
         if (query.Kind is not null)
         {
             predicates.Add("e.kind=$kind");
@@ -1044,22 +1116,88 @@ public sealed class SqliteIndexStore : IIndexStore
 
     private static string FtsLiteral(string value) => "\"" + value.Replace("\"", "\"\"") + "\"";
 
-    private static string BuildOrderBy(EntrySortField sortBy, SortDirection sortDirection, int schemaVersion)
+    private static IReadOnlyList<SortTerm> BuildSortTerms(EntrySortField sortBy, SortDirection sortDirection, int schemaVersion)
     {
-        var direction = sortDirection == SortDirection.Ascending ? "ASC" : "DESC";
+        var descending = sortDirection == SortDirection.Descending;
         var pathSearch = schemaVersion >= 3 ? "e.path_search" : "invariant_lower(e.full_path)";
-        var primary = sortBy switch
+        List<SortTerm> terms = sortBy switch
         {
-            EntrySortField.Name => $"e.name_search COLLATE BINARY {direction}",
-            EntrySortField.Path => $"{pathSearch} COLLATE BINARY {direction}",
-            EntrySortField.Kind => $"e.kind {direction}",
-            EntrySortField.Size => $"(e.size_bytes IS NULL) ASC, e.size_bytes {direction}",
-            EntrySortField.Created => $"e.created_ticks {direction}",
-            EntrySortField.Modified => $"e.modified_ticks {direction}",
+            EntrySortField.Name => [new("e.name_search COLLATE BINARY", true, descending)],
+            EntrySortField.Path => [new($"{pathSearch} COLLATE BINARY", true, descending)],
+            EntrySortField.Kind => [new("e.kind", false, descending)],
+            EntrySortField.Size => [new("(e.size_bytes IS NULL)", false, false), new("COALESCE(e.size_bytes, 0)", false, descending)],
+            EntrySortField.Created => [new("e.created_ticks", false, descending)],
+            EntrySortField.Modified => [new("e.modified_ticks", false, descending)],
+            EntrySortField.FileType => [new("e.kind", false, true),
+                new(schemaVersion >= 4 ? "e.file_type COLLATE BINARY" : "file_type_key(e.name, e.kind) COLLATE BINARY", true, descending)],
             _ => throw new ArgumentOutOfRangeException(nameof(sortBy))
         };
-        return $"{primary}, e.path_key COLLATE BINARY ASC, e.root_key COLLATE BINARY ASC";
+        terms.Add(new SortTerm("e.path_key COLLATE BINARY", true, false));
+        terms.Add(new SortTerm("e.root_key COLLATE BINARY", true, false));
+        return terms;
     }
+
+    private static string FileTypeKey(string name, EntryKind kind) => kind == EntryKind.Directory
+        ? string.Empty
+        : Path.GetExtension(name).TrimStart('.').ToLowerInvariant();
+
+    private static string QueryFingerprint(SearchQuery query, string? rootKey,
+        IReadOnlyList<string> terms, string? normalizedName) => Convert.ToHexString(
+        SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            Root = rootKey, Terms = terms, Name = normalizedName, query.Kind,
+            Paths = query.FullPaths.Select(PathRules.Key).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray(),
+            query.MinSizeBytes, query.MaxSizeBytes,
+            CreatedFrom = query.CreatedFromUtc?.UtcTicks, CreatedBefore = query.CreatedBeforeUtc?.UtcTicks,
+            ModifiedFrom = query.ModifiedFromUtc?.UtcTicks, ModifiedBefore = query.ModifiedBeforeUtc?.UtcTicks,
+            query.SortBy, query.SortDirection
+        })));
+
+    private static string EncodeCursor(SearchCursorData cursor) =>
+        Convert.ToBase64String(JsonSerializer.SerializeToUtf8Bytes(cursor));
+
+    private static SearchCursorData DecodeCursor(string token, string fingerprint)
+    {
+        if (token.Length > 512 * 1024)
+            throw new ArgumentException("The search cursor is too long.", nameof(token));
+        try
+        {
+            var cursor = JsonSerializer.Deserialize<SearchCursorData>(Convert.FromBase64String(token));
+            if (cursor is null || cursor.Fingerprint != fingerprint || cursor.Values is null)
+                throw new ArgumentException("The cursor belongs to a different search query.", nameof(token));
+            return cursor;
+        }
+        catch (Exception error) when (error is FormatException or JsonException)
+        {
+            throw new ArgumentException("The search cursor is invalid.", nameof(token), error);
+        }
+    }
+
+    private static string AddCursorPredicate(SqliteCommand command,
+        IReadOnlyList<SortTerm> terms, SearchCursorData cursor)
+    {
+        if (cursor.Values.Length != terms.Count)
+            throw new ArgumentException("The search cursor has invalid sort values.", nameof(cursor));
+        var alternatives = new List<string>(terms.Count);
+        var equals = new List<string>(terms.Count);
+        for (var index = 0; index < terms.Count; index++)
+        {
+            var term = terms[index];
+            var value = cursor.Values[index];
+            if (value is null || (term.IsText ? value.Text is null || value.Number is not null : value.Number is null || value.Text is not null))
+                throw new ArgumentException("The search cursor has invalid sort values.", nameof(cursor));
+            var parameter = $"$cursor{index}";
+            command.Parameters.AddWithValue(parameter, term.IsText ? value.Text! : value.Number!.Value);
+            var comparison = $"{term.Expression} {(term.Descending ? "<" : ">") } {parameter}";
+            alternatives.Add("(" + string.Join(" AND ", equals.Append(comparison)) + ")");
+            equals.Add($"{term.Expression} = {parameter}");
+        }
+        return "(" + string.Join(" OR ", alternatives) + ")";
+    }
+
+    private sealed record SortTerm(string Expression, bool IsText, bool Descending);
+    private sealed record CursorValue(string? Text, long? Number);
+    private sealed record SearchCursorData(string Fingerprint, Guid? ScanId, CursorValue[] Values);
 
     private static void ValidateDateRange(DateTimeOffset? from, DateTimeOffset? before)
     {
@@ -1087,7 +1225,7 @@ public sealed class SqliteIndexStore : IIndexStore
 
     private const string SchemaSql = """
         PRAGMA application_id=1178949169;
-        PRAGMA user_version=3;
+        PRAGMA user_version=4;
         CREATE TABLE IF NOT EXISTS roots(
             root_key TEXT PRIMARY KEY COLLATE BINARY,
             root_path TEXT NOT NULL,
@@ -1105,7 +1243,7 @@ public sealed class SqliteIndexStore : IIndexStore
             scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
             path_key TEXT NOT NULL COLLATE BINARY,
             full_path TEXT NOT NULL, path_search TEXT NOT NULL COLLATE BINARY,
-            name TEXT NOT NULL, name_search TEXT NOT NULL,
+            name TEXT NOT NULL, name_search TEXT NOT NULL, file_type TEXT NOT NULL DEFAULT '' COLLATE BINARY,
             parent_path TEXT NOT NULL, kind INTEGER NOT NULL CHECK(kind IN (0,1)),
             size_bytes INTEGER, created_ticks INTEGER NOT NULL, modified_ticks INTEGER NOT NULL,
             PRIMARY KEY(scan_id, path_key)
@@ -1115,7 +1253,7 @@ public sealed class SqliteIndexStore : IIndexStore
             root_key TEXT NOT NULL REFERENCES roots(root_key) COLLATE BINARY,
             path_key TEXT NOT NULL COLLATE BINARY,
             full_path TEXT NOT NULL, path_search TEXT NOT NULL COLLATE BINARY,
-            name TEXT NOT NULL, name_search TEXT NOT NULL COLLATE BINARY,
+            name TEXT NOT NULL, name_search TEXT NOT NULL COLLATE BINARY, file_type TEXT NOT NULL DEFAULT '' COLLATE BINARY,
             parent_path TEXT NOT NULL, kind INTEGER NOT NULL CHECK(kind IN (0,1)),
             size_bytes INTEGER, created_ticks INTEGER NOT NULL, modified_ticks INTEGER NOT NULL,
             UNIQUE(root_key, path_key)
@@ -1126,6 +1264,7 @@ public sealed class SqliteIndexStore : IIndexStore
         CREATE INDEX IF NOT EXISTS entries_root_name ON entries(root_key, name_search, path_key);
         CREATE INDEX IF NOT EXISTS entries_root_path ON entries(root_key, path_search, path_key);
         CREATE INDEX IF NOT EXISTS entries_root_kind ON entries(root_key, kind, path_key);
+        CREATE INDEX IF NOT EXISTS entries_root_type ON entries(root_key, kind DESC, file_type, path_key);
         CREATE INDEX IF NOT EXISTS entries_root_size ON entries(root_key, size_bytes, path_key);
         CREATE INDEX IF NOT EXISTS entries_root_created ON entries(root_key, created_ticks, path_key);
         CREATE INDEX IF NOT EXISTS entries_root_modified ON entries(root_key, modified_ticks, path_key);
@@ -1216,6 +1355,14 @@ public sealed class SqliteIndexStore : IIndexStore
     private const string MigrationV3ColumnsSql = """
         ALTER TABLE staging ADD COLUMN path_search TEXT NOT NULL DEFAULT '' COLLATE BINARY;
         ALTER TABLE entries ADD COLUMN path_search TEXT NOT NULL DEFAULT '' COLLATE BINARY;
+        """;
+
+    private const string MigrationV4Sql = """
+        ALTER TABLE staging ADD COLUMN file_type TEXT NOT NULL DEFAULT '' COLLATE BINARY;
+        ALTER TABLE entries ADD COLUMN file_type TEXT NOT NULL DEFAULT '' COLLATE BINARY;
+        UPDATE staging SET file_type=file_type_key(name, kind);
+        UPDATE entries SET file_type=file_type_key(name, kind);
+        UPDATE roots SET last_entries=(SELECT COUNT(*) FROM entries e WHERE e.root_key=roots.root_key);
         """;
 
     private const string MigrationV3SearchSql = """

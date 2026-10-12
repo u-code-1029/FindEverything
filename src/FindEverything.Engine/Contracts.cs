@@ -1,7 +1,7 @@
 namespace FindEverything.Engine;
 
 public enum EntryKind { File, Directory }
-public enum EntrySortField { Name, Path, Kind, Size, Created, Modified }
+public enum EntrySortField { Name, Path, Kind, Size, Created, Modified, FileType }
 public enum SortDirection { Ascending, Descending }
 public enum ScanStatus { Completed, Partial, Cancelled, Deferred }
 public enum DeferralReason { ExplicitRule, HistoricalEntryCount, HistoricalDuration, EntryBudget, TimeBudget, PendingLimit }
@@ -210,6 +210,8 @@ public sealed record DirectoryDiscoveryRequest(string RootPath)
 
 public sealed record SearchQuery
 {
+    /// <summary>Optional exact absolute-path restriction, at most 1000 paths per request.</summary>
+    public IReadOnlyList<string> FullPaths { get; init; } = [];
     // Whitespace-delimited literal terms. Every term must occur in either the
     // entry name or its full path; matching is case-insensitive.
     public string? SearchText { get; init; }
@@ -227,12 +229,29 @@ public sealed record SearchQuery
     public SortDirection SortDirection { get; init; } = SortDirection.Ascending;
     public int Limit { get; init; } = 100;
     public int Offset { get; init; }
+    /// <summary>Skips the full match count when false. The result count is then -1.</summary>
+    public bool IncludeTotalCount { get; init; } = true;
+    /// <summary>Rejects a page from another published generation. Requires RootPath.</summary>
+    public Guid? ExpectedScanId { get; init; }
+    /// <summary>Opaque sequential-page cursor returned by the preceding matching query.</summary>
+    public string? AfterCursor { get; init; }
 }
 
 public sealed record SearchResult(IReadOnlyList<IndexedEntry> Entries, bool HasMore)
 {
     public long TotalCount { get; init; }
     public bool HasPendingScopes { get; init; }
+    public bool TotalCountIncluded { get; init; } = true;
+    public Guid? LastScanId { get; init; }
+    public string? NextCursor { get; init; }
+}
+
+public sealed class PublishedIndexChangedException(string rootPath, Guid? expectedScanId, Guid? actualScanId)
+    : InvalidOperationException($"The published index for '{rootPath}' changed while results were being read.")
+{
+    public string RootPath { get; } = rootPath;
+    public Guid? ExpectedScanId { get; } = expectedScanId;
+    public Guid? ActualScanId { get; } = actualScanId;
 }
 
 public sealed record IndexRootStatus(
